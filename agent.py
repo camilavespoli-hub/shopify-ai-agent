@@ -59,31 +59,31 @@ def get_token():
 
 
 # [START client-credentials.query-products]
-def graphql(query):
-    response = requests.post(
-        f"https://{SHOP}.myshopify.com/admin/api/2025-01/graphql.json",
+def graphql(query): #It takes our specific requests and delivers them to Shopify's servers. When my Agent needs read or write something, it will go through graphql
+    response = requests.post( #Send information a specific web address
+        f"https://{SHOP}.myshopify.com/admin/api/2025-01/graphql.json", #2025 version
         headers={
-            "Content-Type": "application/json",
-            "X-Shopify-Access-Token": get_token(),
+            "Content-Type": "application/json", #sending a JSON object
+            "X-Shopify-Access-Token": get_token(), #CRUCIAL: Calls my token function to send the message, without it, it's impossible to communicate with Shopify
         },
-        json={"query": query},
-        timeout=30,
+        json={"query": query}, #The message - what I want to do. We wrap it in a JSON dictionary because that's the format the API expects
+        timeout=30, #wait 30s for the response
     )
-    response.raise_for_status()
-    payload = response.json()
+    response.raise_for_status() #Checkpoint: Stops the program if the server returns a 404 (no found) or 500 (server error)
+    payload = response.json() #Unpacker: Converts the raw response from Shopify into a Python dictionary
     if payload.get("errors"):
-        raise RuntimeError(payload["errors"])
-    return payload["data"]
+        raise RuntimeError(payload["errors"]) #catch the error so we don't process the "garbage" data
+    return payload["data"] #Returns the information we asked for, ignoring the metadata
 # [END client-credentials.query-products]
 
 
-def main() -> None:
-    query = "{ products(first: 3) { edges { node { id title handle } } } }"
-    data = graphql(query)
-    print(data)
+def main() -> None: #Use none to indicate that the function performs actions but doesn't return a specific value
+    query = "{ products(first: 3) { edges { node { id title handle } } } }" #Specific instruction
+    data = graphql(query) #sent the query to graphql
+    print(data) #Print the result
 
 
 
-if __name__ == "__main__":
+if __name__ == "__main__": #Standard Python protecton - Only run the main() function if I'm running this file directly
     main()
-    print(f"Token: {token} and expires at: {token_expires_at}")
+    
