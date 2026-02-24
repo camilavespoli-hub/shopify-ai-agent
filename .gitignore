@@ -9,10 +9,14 @@ chroma_db/
 # Logs
 system.log
 
-# Python cache
 __pycache__/
 *.pyc
 *.pyo
 
 # Mac system files
 .DS_Store
+
+#Shopify
+shopify.app.toml
+package.json
+package-lock.json
