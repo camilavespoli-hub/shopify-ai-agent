@@ -1,1 +1,18 @@
+# Credentials & secrets
 .env
+service_account.json
+
+# Database & vector memory
+pipeline.db
+chroma_db/
+
+# Logs
+system.log
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Mac system files
+.DS_Store
