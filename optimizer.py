@@ -8,9 +8,11 @@ from chromadb.utils import embedding_functions
 from datetime import date
 
 
+
 # ─────────────────────────────────────────────
 # INPUT VALIDATOR
 # ─────────────────────────────────────────────
+
 
 def validate_optimizer_inputs(draft_text, content_row, reviewer_result, config):
     """
@@ -19,6 +21,7 @@ def validate_optimizer_inputs(draft_text, content_row, reviewer_result, config):
     """
     errors   = []
     warnings = []
+
 
     # 1. Reviewer compliance gate — HARD REQUIREMENT
     if not reviewer_result or not isinstance(reviewer_result, dict):
@@ -34,6 +37,7 @@ def validate_optimizer_inputs(draft_text, content_row, reviewer_result, config):
                 f"Summary: {reviewer_result.get('reviewer_summary', 'none')}"
             )
 
+
     # 2. Draft must exist and be substantive
     if not draft_text or not isinstance(draft_text, str):
         errors.append("draft_text is required and must be a string.")
@@ -43,6 +47,7 @@ def validate_optimizer_inputs(draft_text, content_row, reviewer_result, config):
             "Minimum 200 characters required."
         )
 
+
     # 3. Content row fields
     if not content_row.get("Title"):
         errors.append("Title is required in content_row.")
@@ -50,6 +55,7 @@ def validate_optimizer_inputs(draft_text, content_row, reviewer_result, config):
         errors.append("Keyword is required in content_row.")
     if not content_row.get("Section"):
         errors.append("Section is required in content_row.")
+
 
     # 4. Technical constraints — stop if missing (malformed metadata risk)
     brand = config.get("brand", {})
@@ -60,6 +66,7 @@ def validate_optimizer_inputs(draft_text, content_row, reviewer_result, config):
     if not brand.get("slug_rules"):
         errors.append("Config missing: 'slug_rules' in Config_Brand.")
 
+
     # 5. Internal links — warn only (can use placeholders)
     if not content_row.get("available_internal_links"):
         warnings.append(
@@ -68,6 +75,7 @@ def validate_optimizer_inputs(draft_text, content_row, reviewer_result, config):
             "Resolve before marking 'Ready for Approval'."
         )
 
+
     # 6. Schema config — warn only (graceful degradation)
     if not brand.get("schema_type"):
         warnings.append(
@@ -75,12 +83,15 @@ def validate_optimizer_inputs(draft_text, content_row, reviewer_result, config):
             "Schema will not be generated."
         )
 
+
     return {"valid": len(errors) == 0, "errors": errors, "warnings": warnings}
+
 
 
 # ─────────────────────────────────────────────
 # OUTPUT PARSER
 # ─────────────────────────────────────────────
+
 
 def parse_optimizer_output(raw_output):
     """
@@ -98,6 +109,7 @@ def parse_optimizer_output(raw_output):
         "html":             "",
         "status":           "Ready for Approval"
     }
+
 
     # ── Extract METADATA block ────────────────
     meta_match = re.search(
@@ -124,6 +136,7 @@ def parse_optimizer_output(raw_output):
                 else:
                     result[key] = val
 
+
     # ── Extract SCHEMA block ──────────────────
     schema_match = re.search(
         r"--- SCHEMA ---\n(.*?)(?=--- OPTIMIZED HTML ---)",
@@ -131,6 +144,7 @@ def parse_optimizer_output(raw_output):
     )
     if schema_match:
         result["schema"] = schema_match.group(1).strip()
+
 
     # ── Extract HTML block ────────────────────
     html_match = re.search(
@@ -145,10 +159,12 @@ def parse_optimizer_output(raw_output):
             .strip()
         )
 
+
     # ── Detect NEEDS REVIEW flags ─────────────
     needs_review = re.findall(r"<!-- NEEDS REVIEW: (.*?) -->", raw_output)
     if needs_review:
         result["warnings"].extend(needs_review)
+
 
     # ── If HTML block empty, fallback ─────────
     if not result["html"]:
@@ -160,16 +176,20 @@ def parse_optimizer_output(raw_output):
         if "<" in clean:
             result["html"] = clean
 
+
     # ── Final status ──────────────────────────
     if result["warnings"]:
         result["status"] = "Needs Review"
 
+
     return result
+
 
 
 # ─────────────────────────────────────────────
 # PROMPT BUILDER
 # ─────────────────────────────────────────────
+
 
 def build_optimizer_prompt(draft_text, content_row, product_list_text,
                             related_reading, internal_links, config,
@@ -192,15 +212,17 @@ def build_optimizer_prompt(draft_text, content_row, product_list_text,
                         "lowercase, hyphens only, include primary keyword, max 6 words")
     schema_type          = brand.get("schema_type",             "BlogPosting")
     faq_required         = brand.get("faq_schema_required",     "yes")
-    word_min             = brand.get("default_word_count_min",  "300")
-    word_max             = brand.get("default_word_count_max",  "500")
+    # ✅ FIX 3: defaults alineados con el Reviewer (800/1500, no 300/500)
+    word_min             = brand.get("default_word_count_min",  "800")
+    word_max             = brand.get("default_word_count_max",  "1500")
     publish_date         = content_row.get("ScheduledDate",     str(date.today()))
-    h2_color            = brand.get("h2_color",              "#18655C")
-    h3_color        = brand.get("h3_color",            "#121212")  
-    h4_color        = brand.get("h4_color",            "#121212")
-    faq_title_color     = brand.get("faq_title_color",        "#4B2E4A")
-    fda_color           = brand.get("fda_disclaimer_color",   "#575654")
-    body_color          = brand.get("body_text_color",         "#121212")
+    h2_color             = brand.get("h2_color",                "#18655C")
+    h3_color             = brand.get("h3_color",                "#121212")
+    h4_color             = brand.get("h4_color",                "#121212")
+    faq_title_color      = brand.get("faq_title_color",         "#4B2E4A")
+    fda_color            = brand.get("fda_disclaimer_color",    "#575654")
+    body_color           = brand.get("body_text_color",         "#121212")
+
 
     # Internal link block
     if has_internal_links:
@@ -211,6 +233,7 @@ def build_optimizer_prompt(draft_text, content_row, product_list_text,
             "Insert exactly 2 placeholder comments where links would go:\n"
             "<!-- INTERNAL LINK PLACEHOLDER: [describe target topic] -->"
         )
+
 
     # Schema block
     if has_schema_config:
@@ -254,12 +277,16 @@ def build_optimizer_prompt(draft_text, content_row, product_list_text,
             "Add at top of HTML: <!-- NEEDS REVIEW: schema not generated -->"
         )
 
+
     return f"""You are a senior SEO and Answer Engine Optimization (AEO) specialist for {brand_name}.
+
 
 You receive a Markdown draft that has passed compliance and brand review.
 Your job: convert it to clean HTML and apply all SEO/AEO optimizations.
 
+
 CRITICAL: Do NOT change any factual claims, citations, health statements, or FDA disclaimers.
+
 
 ════════════════════════════════════════
 INPUTS
@@ -272,26 +299,32 @@ AUTHOR             : {author_name}
 PUBLISH DATE       : {publish_date}
 WORD COUNT RANGE   : {word_min}–{word_max} words
 
+
 AVAILABLE PRODUCTS TO LINK:
 {product_list_text}
+
 
 POTENTIAL RELATED ARTICLE:
 {related_reading if related_reading else "None available."}
 
+
 {internal_link_block}
+
 
 MARKDOWN DRAFT (compliance-approved — convert to HTML, do NOT change content):
 {draft_text}
+
 
 ════════════════════════════════════════
 TASKS (complete all in order)
 ════════════════════════════════════════
 
+
 ─── TASK 1: MARKDOWN → HTML CONVERSION ───────────────────────────
 Convert the Markdown draft to clean HTML:
 - ## Heading → <h2 style="color: {h2_color};">[text]</h2>
-- ### Heading → <h3 style="color: {h3_color};">[text]</h3> 
-- #### Heading → <h4 style="color: {h4_color};">[text]</h4> 
+- ### Heading → <h3 style="color: {h3_color};">[text]</h3>
+- #### Heading → <h4 style="color: {h4_color};">[text]</h4>
 - **bold** → <strong>
 - *italic* → <em>
 - - list item → <li> inside <ul>
@@ -309,6 +342,7 @@ Each Q → <div class="faq-item"><h3>[Q]</h3><p>[A]</p></div>
 Each source → <li><a href="[URL]">[Title] ([Year])</a></li>
 Do NOT add <html>, <head>, or <body> tags.
 
+
 ─── TASK 2: SEO STRUCTURE VERIFICATION ───────────────────────────
 After conversion, check and fix only if clearly broken:
 2a. DO NOT add an <h1> tag. The title is published separately by Shopify.
@@ -317,6 +351,7 @@ After conversion, check and fix only if clearly broken:
 2c. At least one <h2> must be phrased as a question.
 2d. Secondary keywords ({secondary_keywords}) in at least one <h2> or <p>.
 2e. Do NOT add or remove heading levels beyond the above.
+
 
 ─── TASK 3: INTERNAL LINKING ─────────────────────────────────────
 3a. Inject 1–2 product links from AVAILABLE PRODUCTS TO LINK:
@@ -328,6 +363,7 @@ After conversion, check and fix only if clearly broken:
 3c. Add 2 internal links from INTERNAL LINK INVENTORY.
     If unavailable, insert placeholder comments.
 3d. All anchor text must be descriptive — no "click here" or bare URLs.
+
 
 ─── TASK 4: AEO STRUCTURE ────────────────────────────────────────
 4a. Verify opening paragraph answers the title question in 40–60 words.
@@ -347,26 +383,32 @@ After conversion, check and fix only if clearly broken:
     <section class="sources"><h2>Sources</h2></section>
     <!-- NEEDS REVIEW: sources section was empty -->
 
+
 ─── TASK 5: METADATA ─────────────────────────────────────────────
 META TITLE:
   - Primary keyword near start
   - Max {meta_title_limit} characters
   - Format: [Primary keyword phrase] | {brand_name}
 
+
 META DESCRIPTION:
   - Max {meta_desc_limit} characters
   - Include primary keyword
   - End with value proposition, no disease language
 
+
 URL SLUG:
   - Rules: {slug_rules}
   - Must include: {primary_keyword}
 
+
 Append author byline before closing:
 <p class="author-byline">Written by <strong>{author_name}</strong> | Last Updated: {publish_date}</p>
 
+
 ─── TASK 6: SCHEMA ───────────────────────────────────────────────
 {schema_block}
+
 
 ─── TASK 7: TECHNICAL VALIDATION ─────────────────────────────────
 7a. No broken href attributes.
@@ -376,9 +418,11 @@ Append author byline before closing:
 7e. Word count {word_min}–{word_max}: flag if outside range.
 7f. FDA disclaimer must not be modified.
 
+
 ════════════════════════════════════════
 OUTPUT FORMAT (return in EXACTLY this order)
 ════════════════════════════════════════
+
 
 --- METADATA ---
 META TITLE: [value]
@@ -387,11 +431,14 @@ URL SLUG: [value]
 WORD COUNT: [number]
 WARNINGS: [comma-separated list or "none"]
 
+
 --- SCHEMA ---
 [JSON-LD <script> blocks — omit entire section if schema not configured]
 
+
 --- OPTIMIZED HTML ---
 [Full HTML — raw only, no markdown fences, no backticks]
+
 
 ════════════════════════════════════════
 ABSOLUTE CONSTRAINTS
@@ -403,32 +450,43 @@ ABSOLUTE CONSTRAINTS
 - If unsure whether a change is needed, DO NOT make it."""
 
 
+
 # ─────────────────────────────────────────────
 # MAIN AGENT CLASS
 # ─────────────────────────────────────────────
+
 
 class OptimizerAgent:
     def __init__(self, config=None):
         """
         Agent 5: SEO & AEO Optimizer.
 
+
         Input : plain Markdown text from ReviewerAgent
         Output: structured dict with HTML, metadata, schema, status
+
 
         Tools : Shopify GraphQL (product links), ChromaDB (related articles)
         """
         print("⚙️ Initializing Optimizer Agent...")
-        self.config = config or {"brand": {}}
+        self.config = config or {"brand": {}, "system": {}}
+
 
         # ── Gemini ──────────────────────────────
         api_key = os.getenv("GOOGLE_API_KEY")
         self.client = genai.Client(api_key=api_key)
-        self.model_name = os.getenv("GEMINI_MODEL", "gemini-2.5-pro")
+        # ✅ FIX 1: model priority — Config_System → env var → default
+        self.model_name = (
+            self.config.get("system", {}).get("Gemini_Model")
+            or os.getenv("GEMINI_MODEL", "gemini-2.5-pro")
+        )
+        print(f"   🤖 Model: {self.model_name}")
 
 
         # ── Shopify ─────────────────────────────
         self.shopify_domain = os.getenv("SHOPIFY_STORE_DOMAIN")
         self.shopify_token  = os.getenv("SHOPIFY_ACCESS_TOKEN")
+
 
         # ── ChromaDB ────────────────────────────
         self.chroma_client = chromadb.PersistentClient(path="./chroma_db")
@@ -440,19 +498,22 @@ class OptimizerAgent:
             embedding_function=self.embed_fn
         )
 
+
     # ── TOOL 1: Shopify Products ─────────────────────────────────────────
     def get_shopify_products_graphql(self):
         """TOOL: Fetches active products via Shopify Admin GraphQL API."""
         fallback_products = [
-            {"title": "GloRest",                        "url": "/products/glorest"},
-            {"title": "GloSerene",                      "url": "/products/gloserene"},
-            {"title": "GloBalance",                     "url": "/products/globalance"},
-            {"title": "The Complete Day & Night System", "url": "/products/the-complete-day-night-system"}
+            {"title": "GloRest",                         "url": "/products/glorest"},
+            {"title": "GloSerene",                       "url": "/products/gloserene"},
+            {"title": "GloBalance",                      "url": "/products/globalance"},
+            {"title": "The Complete Day & Night System",  "url": "/products/the-complete-day-night-system"}
         ]
+
 
         if not self.shopify_domain or not self.shopify_token:
             print("⚠️ Shopify credentials missing. Using fallback product links.")
             return fallback_products
+
 
         url = f"https://{self.shopify_domain}/admin/api/2024-04/graphql.json"
         headers = {
@@ -461,26 +522,27 @@ class OptimizerAgent:
         }
         query = """
         {
-        products(first: 20, query: "status:active") {
+          products(first: 20, query: "status:active") {
             edges { node { title handle } }
-        }
+          }
         }
         """
         try:
             response = requests.post(url, json={"query": query},
-                                    headers=headers, timeout=10)
+                                     headers=headers, timeout=10)
             if response.status_code == 200:
                 edges = response.json()["data"]["products"]["edges"]
                 return [
                     {"title": e["node"]["title"],
-                    "url":   f"/products/{e['node']['handle']}"}
+                     "url":   f"/products/{e['node']['handle']}"}
                     for e in edges
                 ]
             print(f"⚠️ Shopify returned status {response.status_code}.")
             return fallback_products
-        except Exception as e:                           # ← named exception
+        except Exception as e:
             print(f"⚠️ Shopify GraphQL failed: {e}")
             return fallback_products
+
 
     # ── TOOL 2: ChromaDB Related Blogs ───────────────────────────────────
     def get_related_blogs(self, current_summary):
@@ -499,6 +561,7 @@ class OptimizerAgent:
             print(f"⚠️ ChromaDB search failed: {e}")
         return ""
 
+
     # ── TOOL 3: Save to Memory ────────────────────────────────────────────
     def add_to_memory(self, title, summary, url):
         """
@@ -515,10 +578,12 @@ class OptimizerAgent:
         except Exception as e:
             print(f"🚨 Failed to add to vector memory: {e}")
 
+
     # ── MAIN: optimize_draft ──────────────────────────────────────────────
     def optimize_draft(self, content_row, draft_text, reviewer_result, config=None):
         """
         Full SEO & AEO optimization pipeline.
+
 
         Args:
             content_row     : dict — from Content_Plan
@@ -529,6 +594,7 @@ class OptimizerAgent:
                               "PASS_WITH_NOTES", "reviewer_summary": "..."}
             config          : dict — from Google Sheets config tabs
 
+
         Returns:
             dict — status, html, meta_title, meta_description,
                    url_slug, word_count, schema, warnings, errors
@@ -536,10 +602,13 @@ class OptimizerAgent:
         if config is None:
             config = self.config
 
+
         title   = content_row.get("Title",   "untitled")
         summary = content_row.get("Summary", title)
 
+
         print(f"\n⚙️ Optimizer running for: {title}")
+
 
         # ── Step 1: Validate inputs ──────────
         validation = validate_optimizer_inputs(
@@ -561,9 +630,11 @@ class OptimizerAgent:
                 "schema":            ""
             }
 
+
         if validation["warnings"]:
             for w in validation["warnings"]:
                 print(f"   ⚠ {w}")
+
 
         # ── Step 2: Gather tool outputs ──────
         products = self.get_shopify_products_graphql()
@@ -571,17 +642,20 @@ class OptimizerAgent:
             f"- {p['title']} (URL: {p['url']})" for p in products
         ])
 
+
         # ChromaDB returns "Title|URL" or ""
-        raw_related       = self.get_related_blogs(summary)
-        related_reading   = ""
+        raw_related     = self.get_related_blogs(summary)
+        related_reading = ""
         if raw_related and "|" in raw_related:
             parts = raw_related.split("|", 1)
             related_reading = (
                 f"Title: {parts[0].strip()} | URL: {parts[1].strip()}"
             )
 
+
         has_internal_links = bool(content_row.get("available_internal_links"))
         has_schema_config  = bool(config.get("brand", {}).get("schema_type"))
+
 
         # ── Step 3: Build prompt ─────────────
         prompt = build_optimizer_prompt(
@@ -595,8 +669,10 @@ class OptimizerAgent:
             has_internal_links = has_internal_links
         )
 
+
         # ── Step 4: Call Gemini ──────────────
-        print(f"🤖 Calling Gemini ({os.getenv('GEMINI_MODEL', 'gemini-2.5-flash')})...")
+        # ✅ FIX 2: uses self.model_name — no hardcoded default
+        print(f"   🤖 Calling Gemini ({self.model_name})...")
         try:
             raw_response = self.client.models.generate_content(
                 model=self.model_name, contents=prompt
@@ -615,11 +691,14 @@ class OptimizerAgent:
                 "schema":           ""
             }
 
+
         # ── Step 5: Parse structured output ──
         parsed = parse_optimizer_output(raw_response)
 
+
         # Merge input validation warnings
         parsed["warnings"] = validation["warnings"] + parsed["warnings"]
+
 
         # Non-blocking warnings — informational only, don't change status
         non_blocking = [
@@ -646,4 +725,7 @@ class OptimizerAgent:
             for w in parsed["warnings"]:
                 print(f"   ⚠ {w}")
 
+
+        # ✅ FIX 4: always include "errors" key so Orchestrator never gets KeyError
+        parsed["errors"] = []
         return parsed

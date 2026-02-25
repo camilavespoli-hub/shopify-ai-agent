@@ -1,8 +1,35 @@
-requests>=2.31.0
-google-auth>=2.27.0
-google-auth-oauthlib>=1.2.0
-google-auth-httplib2>=0.2.0
-google-api-python-client>=2.116.0
-gspread>=5.12.0
-google-generativeai>=0.3.2
-python-dotenv>=1.0.0
+# ══════════════════════════════════════════════
+# GOOGLE AI
+# ══════════════════════════════════════════════
+google-genai                  # Gemini API — from google import genai
+
+# ══════════════════════════════════════════════
+# GOOGLE SHEETS
+# ══════════════════════════════════════════════
+gspread                       # Google Sheets client
+google-auth                   # Authentication for gspread
+google-auth-oauthlib          # OAuth for gspread service account
+
+# ══════════════════════════════════════════════
+# WEB SEARCH
+# ══════════════════════════════════════════════
+duckduckgo-search             # DuckDuckGo search — from duckduckgo_search import DDGS
+pytrends                      # Google Trends — used in Planner
+
+# ══════════════════════════════════════════════
+# VECTOR DATABASE (duplicate detection)
+# ══════════════════════════════════════════════
+chromadb                      # ChromaDB — semantic memory for Planner
+sentence-transformers         # Embeddings engine for ChromaDB
+
+# ══════════════════════════════════════════════
+# HTML PARSING
+# ══════════════════════════════════════════════
+beautifulsoup4                # HTML parsing — from bs4 import BeautifulSoup
+lxml                          # Parser backend for BeautifulSoup (faster)
+
+# ══════════════════════════════════════════════
+# HTTP & ENVIRONMENT
+# ══════════════════════════════════════════════
+requests                      # HTTP calls (PubMed, Wikidata, Telegram, Shopify)
+python-dotenv                 # .env file loader — from dotenv import load_dotenv
