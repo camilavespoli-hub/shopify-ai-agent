@@ -4,7 +4,6 @@ import time
 import requests
 
 
-
 # ─────────────────────────────────────────────
 # INPUT VALIDATOR
 # ─────────────────────────────────────────────
@@ -17,7 +16,6 @@ def validate_publisher_inputs(content_row, optimizer_result, config):
     """
     errors   = []
     warnings = []
-
 
     # 1. Optimizer result must be a passing dict
     if not optimizer_result or not isinstance(optimizer_result, dict):
@@ -32,7 +30,6 @@ def validate_publisher_inputs(content_row, optimizer_result, config):
                 f"Cannot publish: Optimizer was BLOCKED. "
                 f"Errors: {optimizer_result.get('errors', [])}"
             )
-        # "Needs Review" is allowed — Orchestrator decides to publish anyway
         if not optimizer_result.get("html"):
             errors.append(
                 "optimizer_result is missing 'html'. "
@@ -54,7 +51,6 @@ def validate_publisher_inputs(content_row, optimizer_result, config):
                 "Shopify will auto-generate a handle."
             )
 
-
     # 2. Content row fields
     if not content_row.get("Title"):
         errors.append("Title is required in content_row.")
@@ -72,7 +68,6 @@ def validate_publisher_inputs(content_row, optimizer_result, config):
             "Summary missing — ChromaDB memory will not be updated after publish."
         )
 
-
     # 3. Config
     brand = config.get("brand", {})
     if not brand.get("default_author_name"):
@@ -85,9 +80,7 @@ def validate_publisher_inputs(content_row, optimizer_result, config):
             "PEXELS_API_KEY not set — featured image will use placeholder."
         )
 
-
     return {"valid": len(errors) == 0, "errors": errors, "warnings": warnings}
-
 
 
 # ─────────────────────────────────────────────
@@ -100,14 +93,12 @@ class PublisherAgent:
         """
         Agent 6: Shopify Publisher.
 
-
         Tools  : Shopify Admin GraphQL API, Pexels Image API
         Input  : structured dicts from OptimizerAgent + Content_Plan row
         Output : structured dict with status, shopify_id, admin_url
 
-
         Key behaviours:
-        - Uses static SHOPIFY_ACCESS_TOKEN — consistent with OptimizerAgent
+        - Credentials validated in __init__, not at module import time
         - JSON-LD schema prepended to HTML before publish
         - SEO title + description sent via metafields (global namespace)
           — "seo" is not a valid ArticleCreateInput field
@@ -117,24 +108,48 @@ class PublisherAgent:
           after every successful publish
         """
         print("🔌 Initializing Shopify Publisher Agent...")
-        # ✅ FIX 4: consistent default with Reviewer and Optimizer
+        # ✅ FIX: consistent default with Reviewer and Optimizer
         self.config          = config or {"brand": {}, "system": {}}
-        self.optimizer_agent = optimizer_agent  # For add_to_memory() after publish
+        self.optimizer_agent = optimizer_agent
 
+        # ── Credentials — same vars as .env ──────────────────────────
+        self.shop          = os.getenv("SHOPIFY_SHOP")
+        self.client_id     = os.getenv("SHOPIFY_CLIENT_ID")
+        self.client_secret = os.getenv("SHOPIFY_CLIENT_SECRET")
+        self.pexels_key    = os.getenv("PEXELS_API_KEY")
 
-        # ── Credentials ───────────────────────────────────────────────
-        # ✅ FIX 1 + 2: static token — same env vars as Optimizer
-        # Shopify Custom Apps use a permanent access_token (no OAuth flow)
-        self.shop_domain  = os.getenv("SHOPIFY_STORE_DOMAIN")
-        self.access_token = os.getenv("SHOPIFY_ACCESS_TOKEN")
-        self.pexels_key   = os.getenv("PEXELS_API_KEY")
-
-
-        if not self.shop_domain or not self.access_token:
+        if not self.shop or not self.client_id or not self.client_secret:
             raise RuntimeError(
-                "PublisherAgent requires SHOPIFY_STORE_DOMAIN and "
-                "SHOPIFY_ACCESS_TOKEN environment variables."
+                "PublisherAgent requires SHOPIFY_SHOP, SHOPIFY_CLIENT_ID, "
+                "and SHOPIFY_CLIENT_SECRET environment variables."
             )
+
+        # ── Token cache ──────────────────────────────────────────────
+        self._token            = None
+        self._token_expires_at = 0.0
+
+
+    # ── AUTH: Get / Refresh Token ────────────────────────────────────────
+    def _get_token(self):
+        """Returns a valid Shopify access token, refreshing if expired."""
+        if self._token and time.time() < self._token_expires_at - 60:
+            return self._token
+
+        response = requests.post(
+            f"https://{self.shop}.myshopify.com/admin/oauth/access_token",
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            data={
+                "grant_type":    "client_credentials",
+                "client_id":     self.client_id,
+                "client_secret": self.client_secret,
+            },
+            timeout=30,
+        )
+        response.raise_for_status()
+        data                   = response.json()
+        self._token            = data["access_token"]
+        self._token_expires_at = time.time() + data.get("expires_in", 3600)
+        return self._token
 
 
     # ── CORE: GraphQL Dispatcher ─────────────────────────────────────────
@@ -144,14 +159,12 @@ class PublisherAgent:
         if variables:
             payload["variables"] = variables
 
-
         response = requests.post(
-            # ✅ FIX 2 + 3: uses shop_domain, consistent API version (2024-04)
-            f"https://{self.shop_domain}/admin/api/2024-04/graphql.json",
+            # ✅ FIX: API version 2024-04 — consistent with Optimizer
+            f"https://{self.shop}.myshopify.com/admin/api/2024-04/graphql.json",
             headers={
                 "Content-Type":           "application/json",
-                # ✅ FIX 1: static token — no OAuth flow needed
-                "X-Shopify-Access-Token": self.access_token,
+                "X-Shopify-Access-Token": self._get_token(),
             },
             json=payload,
             timeout=30,
@@ -159,11 +172,9 @@ class PublisherAgent:
         response.raise_for_status()
         data = response.json()
 
-
         if data.get("errors"):
             print(f"   🚨 Shopify GraphQL error: {data['errors']}")
             raise RuntimeError(data["errors"])
-
 
         return data["data"]
 
@@ -179,28 +190,40 @@ class PublisherAgent:
         data  = self._graphql(query)
         edges = data.get("blogs", {}).get("edges", [])
 
-
         if not edges:
             raise ValueError(
                 "No blogs found in Shopify. "
                 "Create at least one blog before publishing."
             )
 
-
-        # Exact name match first
+        section_handle = section_name.lower().replace(" ", "-")
         for edge in edges:
-            if edge["node"]["title"].lower() == section_name.lower():
-                print(f"   📂 Blog matched: '{edge['node']['title']}'")
-                return edge["node"]["id"]
+            node = edge["node"]
+            if (node["title"].lower()  == section_name.lower() or
+                node["handle"].lower() == section_handle):
+                print(f"   📂 Blog matched: '{node['title']}' (handle: {node['handle']})")
+                return node["id"]
 
+        # No direct match — log available blogs
+        available = [f"'{e['node']['title']}' ({e['node']['handle']})" for e in edges]
+        print(f"   ⚠️ No blog matching '{section_name}' found.")
+        print(f"   Available blogs: {', '.join(available)}")
 
-        # Named fallback — never silent
-        fallback = edges[0]["node"]
-        print(
-            f"   ⚠️ No blog named '{section_name}' found. "
-            f"Falling back to: '{fallback['title']}'"
-        )
-        return fallback["id"]
+        # Try default_section from Config_Brand before falling back to first blog
+        default_section = self.config.get("brand", {}).get("default_section", "")
+        if default_section:
+            default_handle = default_section.lower().replace(" ", "-")
+            for edge in edges:
+                node = edge["node"]
+                if (node["title"].lower()  == default_section.lower() or
+                    node["handle"].lower() == default_handle):
+                    print(f"   📂 Using default_section fallback: '{node['title']}'")
+                    return node["id"]
+
+        # Last resort — first blog in Shopify
+        print(f"   ⚠️ Using last-resort fallback: '{edges[0]['node']['title']}'")
+        return edges[0]["node"]["id"]
+
 
 
     # ── TOOL 2: Featured Image ───────────────────────────────────────────
@@ -214,11 +237,9 @@ class PublisherAgent:
         )
         fallback_alt = "Glomend women's wellness"
 
-
         if not self.pexels_key:
             print("   ⚠️ No PEXELS_API_KEY — using placeholder image.")
             return fallback_url, fallback_alt
-
 
         search_term = keyword or "women wellness perimenopause"
         try:
@@ -239,7 +260,6 @@ class PublisherAgent:
         except Exception as e:
             print(f"   ⚠️ Pexels image search failed: {e}")
 
-
         return fallback_url, fallback_alt
 
 
@@ -252,7 +272,6 @@ class PublisherAgent:
         if not schema_block or not schema_block.strip():
             return html_content
 
-
         schema_text = schema_block.strip()
         if not schema_text.startswith("<script"):
             schema_text = (
@@ -260,7 +279,6 @@ class PublisherAgent:
                 f'{schema_text}\n'
                 f'</script>'
             )
-
 
         return f"{schema_text}\n\n{html_content}"
 
@@ -270,14 +288,12 @@ class PublisherAgent:
         """
         Full publish pipeline for one Content_Plan row.
 
-
         Args:
             content_row      : dict — Title, Section, Keyword, Summary,
                                ScheduledDate from Content_Plan
             optimizer_result : dict — html, meta_title, meta_description,
                                url_slug, schema, word_count, status
                                from OptimizerAgent
-
 
         Returns:
             dict — {
@@ -292,10 +308,8 @@ class PublisherAgent:
         if config is None:
             config = self.config
 
-
         title = content_row.get("Title", "untitled")
         print(f"\n🚀 Publisher running for: {title}")
-
 
         # ── Step 1: Validate inputs ──────────
         validation = validate_publisher_inputs(
@@ -314,32 +328,28 @@ class PublisherAgent:
                 "errors":         validation["errors"]
             }
 
-
         if validation["warnings"]:
             for w in validation["warnings"]:
                 print(f"   ⚠ {w}")
 
-
         # ── Step 2: Gather publish data ──────
         brand        = config.get("brand", {})
-        section_name = content_row.get("Section",  "News")
+        default_section = config.get("brand", {}).get("default_section", "")
+        section_name    = content_row.get("Section", "") or default_section
         keyword      = content_row.get("Keyword",  title)
         summary      = content_row.get("Summary",  "")
         author_name  = brand.get("default_author_name", "Glomend Editorial Team")
-
 
         # Visibility — controlled from Content_Plan sheet (col Visibility)
         visibility = content_row.get("Visibility") or \
             config.get("brand", {}).get("default_visibility", "Public")
         is_public  = visibility.strip().lower() == "public"
 
-
         html_content = optimizer_result.get("html",             "")
         schema_block = optimizer_result.get("schema",           "")
         meta_title   = optimizer_result.get("meta_title",       title)
         meta_desc    = optimizer_result.get("meta_description", "")
         url_slug     = optimizer_result.get("url_slug",         "")
-
 
         if url_slug:
             url_slug = re.sub(
@@ -348,14 +358,11 @@ class PublisherAgent:
                 url_slug.lower().replace(" ", "-")
             )
 
-
         # ── Step 3: Assemble final HTML with schema ──
         final_body = self._assemble_body(html_content, schema_block)
 
-
         # ── Step 4: Get featured image ───────
         image_url, image_alt = self._get_featured_image(keyword)
-
 
         # ── Step 5: Find Blog ID ─────────────
         try:
@@ -370,7 +377,6 @@ class PublisherAgent:
                 "warnings":       validation["warnings"],
                 "errors":         [f"Blog lookup failed: {str(e)}"]
             }
-
 
         # ── Step 6: Build GraphQL mutation ───
         mutation = """
@@ -389,8 +395,6 @@ class PublisherAgent:
         }
         """
 
-
-        # Build metafields list — only include if values present
         metafields = []
         if meta_title:
             metafields.append({
@@ -407,14 +411,11 @@ class PublisherAgent:
                 "type":      "single_line_text_field"
             })
 
-
-        # Build tags from keyword (comma-separated support)
         tags = [
             t.strip()
             for t in keyword.split(",")
             if t.strip()
         ][:5]
-
 
         variables = {
             "article": {
@@ -434,9 +435,8 @@ class PublisherAgent:
             }
         }
 
-
         # ── Step 7: Publish to Shopify ───────
-        print(f"   📤 Pushing '{title}' to Shopify as hidden draft...")
+        print(f"   📤 Pushing '{title}' to Shopify...")
         try:
             result = self._graphql(mutation, variables)
         except Exception as e:
@@ -449,7 +449,6 @@ class PublisherAgent:
                 "warnings":       validation["warnings"],
                 "errors":         [f"GraphQL publish failed: {str(e)}"]
             }
-
 
         # ── Step 8: Handle Shopify response ──
         user_errors = result.get("articleCreate", {}).get("userErrors", [])
@@ -465,30 +464,26 @@ class PublisherAgent:
                 "errors":         [f"Shopify userError: {msg}"]
             }
 
-
         article   = result["articleCreate"]["article"]
         raw_id    = article["id"]
         handle    = article.get("handle", "")
         clean_id  = raw_id.split("/")[-1]
         admin_url = (
-            f"https://{self.shop_domain}"
+            f"https://{self.shop}.myshopify.com"
             f"/admin/articles/{clean_id}"
         )
         print(f"   ✅ Draft created: {admin_url}")
 
-
         # ── Step 9: Update ChromaDB memory ───
         if self.optimizer_agent and summary:
-            storefront_url = (
-                f"/blogs/{section_name.lower().replace(' ', '-')}/{handle}"
-            )
+            blog_handle    = section_name.lower().replace(" ", "-")
+            storefront_url = f"/blogs/{blog_handle}/{handle}"
             self.optimizer_agent.add_to_memory(title, summary, storefront_url)
         elif not summary:
             validation["warnings"].append(
                 "NEEDS REVIEW: ChromaDB memory NOT updated — "
                 "Summary was missing from content_row."
             )
-
 
         # ── Step 10: Build final warnings ────
         final_warnings = list(validation["warnings"])
@@ -498,7 +493,6 @@ class PublisherAgent:
                 "Check ReviewerNotes in Google Sheet."
             )
 
-
         # ── Step 11: Report ──────────────────
         print(f"✅ Publish complete.")
         print(f"   Status     : Draft Created")
@@ -507,7 +501,6 @@ class PublisherAgent:
         if final_warnings:
             for w in final_warnings:
                 print(f"   ⚠ {w}")
-
 
         return {
             "status":         "Draft Created",
@@ -519,7 +512,6 @@ class PublisherAgent:
         }
 
 
-
 # ─────────────────────────────────────────────
 # STANDALONE TEST
 # ─────────────────────────────────────────────
@@ -528,7 +520,6 @@ class PublisherAgent:
 if __name__ == "__main__":
     from dotenv import load_dotenv
     load_dotenv()
-
 
     agent = PublisherAgent()
     result = agent.publish_post(

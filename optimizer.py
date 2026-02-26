@@ -484,7 +484,8 @@ class OptimizerAgent:
 
 
         # ── Shopify ─────────────────────────────
-        self.shopify_domain = os.getenv("SHOPIFY_STORE_DOMAIN")
+        shop = os.getenv("SHOPIFY_SHOP")
+        self.shopify_domain = f"{shop}.myshopify.com" if shop else ""
         self.shopify_token  = os.getenv("SHOPIFY_ACCESS_TOKEN")
 
 
