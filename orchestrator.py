@@ -14,7 +14,6 @@ from reviewer         import ReviewerAgent
 from optimizer        import OptimizerAgent
 from publisher        import PublisherAgent
 
-# ChromaManager — graceful fallback if file not yet in place
 try:
     from chroma_manager import ChromaManager
     CHROMA_AVAILABLE = True
@@ -54,6 +53,8 @@ COL = {
     "AdminURL":          19,  # S
     "Published_Status":  20,  # T
     "Visibility":        21,  # U
+    "BlogType":          22,  # V
+    "TopicCluster":      23,  # W
 }
 
 
@@ -62,9 +63,6 @@ class ContentOrchestrator:
     def __init__(self, sheet_name="Blog_agent_ai"):
         print("🤖 Initializing Orchestrator...")
 
-        # ── AWS detection ─────────────────────────────────────────────────────
-        # Locally  → files live in the project folder (DATA_DIR = ".")
-        # On AWS   → files live in /mnt/efs/ (persistent EFS volume)
         self.IS_AWS   = os.getenv("AWS_EXECUTION_ENV") is not None
         self.DATA_DIR = "/mnt/efs" if self.IS_AWS else "."
 
@@ -77,14 +75,8 @@ class ContentOrchestrator:
             print("Verify the sheet is shared with the service_account.json email.")
             exit()
 
-        # SQLite — path adjusts for local vs AWS
-        self.db = DatabaseManager(
-            db_path=os.path.join(self.DATA_DIR, "pipeline.db")
-        )
-
-        # ChromaDB — initialized after load_configurations() (needs brand_name)
+        self.db     = DatabaseManager(db_path=os.path.join(self.DATA_DIR, "pipeline.db"))
         self.chroma = None
-
         self.config = {}
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -120,11 +112,6 @@ class ContentOrchestrator:
             return fallback if fallback is not None else {}
 
     def _get_rule(self, agent_name: str, rule_key: str, default=None):
-        """
-        Reads a rule from Agent_Rules tab (self.config['agent_rules']).
-        Auto-converts TRUE/FALSE strings → bool, numeric strings → int/float.
-        Returns default if the key is not found.
-        """
         val = (
             self.config
             .get("agent_rules", {})
@@ -141,10 +128,6 @@ class ContentOrchestrator:
         return val
 
     def _get_system_setting(self, key: str, default=None):
-        """
-        Reads a setting from Config_System (self.config['system']).
-        Auto-converts TRUE/FALSE and numeric strings.
-        """
         val = self.config.get("system", {}).get(key, default)
         if isinstance(val, str):
             if val.upper() == "TRUE":  return True
@@ -154,24 +137,16 @@ class ContentOrchestrator:
         return val
 
     def _planner_row_to_sheet_list(self, row_dict):
-        """
-        Converts a Planner output dict to a 21-column list matching COL.
-        Columns A–U exactly. All agent-filled columns start empty.
-
-        FIX vs original: TrendScore was incorrectly placed at col J
-        (Reviewer_Notes) and col K (Research_Brief). Now both are empty
-        at planning time — only Status/Title/Section/etc. are filled.
-        """
         return [
-            "",                                            # A  RowID (auto)
-            row_dict.get("Status",            "Pending Approval"),  # B
-            row_dict.get("Title",             ""),         # C
-            row_dict.get("Section",           ""),         # D
-            row_dict.get("Keyword",           ""),         # E
-            row_dict.get("SecondaryKeywords", ""),         # F
-            row_dict.get("Summary",           ""),         # G
-            row_dict.get("ScheduledDate",     ""),         # H
-            row_dict.get("ScheduledTime",     "09:00 AM ET"),  # I
+            "",                                                       # A  RowID (auto)
+            row_dict.get("Status",            "Pending Approval"),    # B
+            row_dict.get("Title",             ""),                    # C
+            row_dict.get("Section",           ""),                    # D
+            row_dict.get("Keyword",           ""),                    # E
+            row_dict.get("SecondaryKeywords", ""),                    # F
+            row_dict.get("Summary",           ""),                    # G
+            row_dict.get("ScheduledDate",     ""),                    # H
+            row_dict.get("ScheduledTime",     "09:00 AM ET"),         # I
             "",   # J  Reviewer_Notes   — empty at planning
             "",   # K  Research_Brief   — empty at planning
             "",   # L  Draft_Content    — empty
@@ -184,6 +159,8 @@ class ContentOrchestrator:
             "",   # S  AdminURL         — empty
             "",   # T  Published_Status — empty
             "",   # U  Visibility       — empty
+            row_dict.get("BlogType",     "educational"),              # V
+            row_dict.get("TopicCluster", ""),                         # W
         ]
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -215,7 +192,6 @@ class ContentOrchestrator:
     def load_configurations(self):
         print("📂 Loading Configurations...")
         try:
-            # ── Config_Brand ──────────────────────────────────────────────────
             brand_rows = self.sh.worksheet("Config_Brand").get_all_records()
             brand_flat = {
                 row["Field Name"]: row["Value"]
@@ -223,7 +199,6 @@ class ContentOrchestrator:
                 if row.get("Field Name")
             }
 
-            # ── Config_System ─────────────────────────────────────────────────
             try:
                 system_rows = self.sh.worksheet("Config_System").get_all_records()
                 system_flat = {
@@ -235,8 +210,6 @@ class ContentOrchestrator:
                 system_flat = {}
                 print("   ⚠️  Config_System tab not found.")
 
-            # ── Agent_Rules ───────────────────────────────────────────────────
-            # Stored as nested dict: { agent_name: { rule_key: rule_value } }
             try:
                 rules_rows  = self.sh.worksheet("Agent_Rules").get_all_records()
                 agent_rules = {}
@@ -250,8 +223,6 @@ class ContentOrchestrator:
                 agent_rules = {}
                 print("   ⚠️  Agent_Rules tab not found.")
 
-            # ── Prompts (optional) ────────────────────────────────────────────
-            # Stored as nested dict: { agent_name: { prompt_key: prompt_text } }
             try:
                 prompt_rows = self.sh.worksheet("Prompts").get_all_records()
                 prompts = {}
@@ -264,17 +235,14 @@ class ContentOrchestrator:
             except Exception:
                 prompts = {}
 
-            # ── Config_Sections ───────────────────────────────────────────────
             sections = self.sh.worksheet("Config_Sections").get_all_records()
 
-            # ── Config_Products (optional) ────────────────────────────────────
             try:
                 product_rows = self.sh.worksheet("Config_Products").get_all_records()
             except Exception:
                 product_rows = []
                 print("   ⚠️  Config_Products tab not found.")
 
-            # ── Config_Cadence (optional) ─────────────────────────────────────
             try:
                 cadence_rows   = self.sh.worksheet("Config_Cadence").get_all_records()
                 active_cadence = next(
@@ -284,7 +252,6 @@ class ContentOrchestrator:
                 active_cadence = {}
                 print("   ⚠️  Config_Cadence tab not found.")
 
-            # ── Config_Planner (optional) ─────────────────────────────────────
             try:
                 planner_rows = self.sh.worksheet("Config_Planner").get_all_records()
                 planner_cfg  = {
@@ -294,7 +261,24 @@ class ContentOrchestrator:
             except Exception:
                 planner_cfg = {}
 
-            # ── Assemble full config ──────────────────────────────────────────
+            # ── Config_BlogTypes ──────────────────────────────────────────────
+            # Stored as nested dict: { blog_type: { rule_key: rule_value } }
+            try:
+                blog_type_rows = self.sh.worksheet("Config_BlogTypes").get_all_records()
+                blog_types = {}
+                for row in blog_type_rows:
+                    bt  = row.get("blog_type", "").strip().lower()
+                    key = row.get("rule_key",  "").strip()
+                    val = row.get("rule_value", "")
+                    if bt and key:
+                        if isinstance(val, str):
+                            if val.upper() == "TRUE":  val = True
+                            elif val.upper() == "FALSE": val = False
+                        blog_types.setdefault(bt, {})[key] = val
+            except Exception:
+                blog_types = {}
+                print("   ⚠️  Config_BlogTypes tab not found — defaults will be used.")
+
             self.config = {
                 "brand":       brand_flat,
                 "system":      system_flat,
@@ -304,13 +288,12 @@ class ContentOrchestrator:
                 "sections":    sections,
                 "products":    product_rows,
                 "cadence":     active_cadence,
+                "blog_types":  blog_types,
             }
 
-            # ── Required fields validation ────────────────────────────────────
-            # disclaimer_text replaces fda_disclaimer_text (industry-agnostic)
             required = [
                 "brand_voice_summary",
-                "disclaimer_text",         # renamed from fda_disclaimer_text
+                "disclaimer_text",
                 "default_word_count_min",
                 "default_word_count_max",
                 "Source_Policy",
@@ -322,7 +305,6 @@ class ContentOrchestrator:
             if missing:
                 print(f"   ⚠️  Missing Config_Brand fields: {missing}")
 
-            # ── Init ChromaDB now that we have brand_name ─────────────────────
             if CHROMA_AVAILABLE:
                 try:
                     brand_name  = brand_flat.get("brand_name", "default")
@@ -338,13 +320,13 @@ class ContentOrchestrator:
             else:
                 print("   ChromaDB  : ⚠️  disabled (chroma_manager.py not found)")
 
-            # ── Startup summary ───────────────────────────────────────────────
             rule_count = sum(len(v) for v in agent_rules.values())
             print(f"   Brand     : {brand_flat.get('brand_name',       '⚠️ not set')}")
-            print(f"   Language  : {brand_flat.get('content_language', '⚠️ not set')}  "
-                  f"| Industry: {brand_flat.get('industry', '⚠️ not set')}")
+            print(f"   Language  : {brand_flat.get('content_language', '⚠️ not set')}"
+                  f"  | Industry: {brand_flat.get('industry', '⚠️ not set')}")
             print(f"   Sections  : {len(sections)}")
             print(f"   Products  : {len(product_rows)}")
+            print(f"   BlogTypes : {len(blog_types)}")
             print(f"   Rules     : {rule_count} rule(s) loaded")
             print(f"   Gemini    : {'✅' if os.getenv('GOOGLE_API_KEY')    else '❌ MISSING'}")
             print(f"   Shopify   : {'✅' if os.getenv('SHOPIFY_SHOP')       else '❌ MISSING'}")
@@ -361,7 +343,6 @@ class ContentOrchestrator:
     # ─────────────────────────────────────────────────────────────────────────
 
     def _send_telegram(self, message: str):
-        """Low-level sender — accepts a pre-formatted Markdown string."""
         token   = os.getenv("TELEGRAM_BOT_TOKEN")
         chat_id = os.getenv("TELEGRAM_CHAT_ID")
         if not token or not chat_id:
@@ -379,17 +360,6 @@ class ContentOrchestrator:
 
     def send_telegram_alert(self, title: str, admin_url: str = "",
                             hidden: bool = False, reason: str = ""):
-        """
-        Sends a post-publish Telegram notification.
-
-        hidden=False → 🚀 standard success message
-        hidden=True  → ⚠️ warning — post is in Shopify but NOT visible
-
-        Templates are read from the Prompts tab:
-          publisher → telegram_message         (live posts)
-          publisher → telegram_hidden_message  (hidden posts)
-        Falls back to built-in defaults when templates are not defined.
-        """
         pub_prompts = self.config.get("prompts", {}).get("publisher", {})
 
         if hidden:
@@ -433,15 +403,11 @@ class ContentOrchestrator:
         if not self.load_configurations():
             return
 
-        # ── Runtime settings (Config_System + Agent_Rules) ────────────────────
-        # start_from_agent argument wins over Config_System value
         system_start = self._get_system_setting("Start_From_Agent", default=1)
         if start_from_agent == 1 and system_start != 1:
             start_from_agent = int(system_start)
 
-        test_mode = self._get_system_setting("Test_Mode", default=False)
-
-        # max_retries: Agent_Rules (orchestrator) > Config_System > hardcoded 3
+        test_mode   = self._get_system_setting("Test_Mode", default=False)
         max_retries = int(
             self._get_rule("orchestrator", "max_retries",
                            default=self._get_system_setting("Max_Retries", default=3))
@@ -471,10 +437,6 @@ class ContentOrchestrator:
 
         # ══════════════════════════════════════════════════════════════════════
         # AGENT 1: PLANNER
-        # Proposes new blog topics from trend signals + section config.
-        # If a proposed topic is semantically similar to an existing post
-        # (ChromaDB), it retries silently up to max_topic_attempts times.
-        # Pipeline NEVER stops due to duplicate detection.
         # ══════════════════════════════════════════════════════════════════════
         if start_from_agent <= 1:
             print("─" * 60)
@@ -508,7 +470,6 @@ class ContentOrchestrator:
                         accepted = False
 
                         for attempt in range(1, max_topic_attempts + 1):
-                            # ChromaDB duplicate check (skipped if chroma not available)
                             if self.chroma:
                                 dup_check = self.chroma.is_duplicate(
                                     title     = title,
@@ -519,7 +480,7 @@ class ContentOrchestrator:
                                 score   = dup_check.get("score",         0.0)
                                 matched = dup_check.get("matched_title", "")
                             else:
-                                is_dup = False  # accept all when chroma is disabled
+                                is_dup = False
 
                             if not is_dup:
                                 approved_rows.append(proposed)
@@ -532,7 +493,6 @@ class ContentOrchestrator:
                                 accepted = True
                                 break
 
-                            # skip mode — ask Planner for a replacement topic
                             print(f"   🔄 '{title}' is {score:.0%} similar to '{matched}' "
                                   f"— retrying ({attempt}/{max_topic_attempts})...")
                             retry_result = planner.plan_next_posts(
@@ -548,7 +508,6 @@ class ContentOrchestrator:
                                 keyword  = proposed.get("Keyword", "")
 
                         if not accepted:
-                            # All attempts exhausted — log and skip, pipeline continues
                             print(f"   ⚠️  Could not find non-duplicate topic after "
                                   f"{max_topic_attempts} attempts — skipping.")
                             self._log("warning", "Planner", title, "SKIPPED",
@@ -583,7 +542,7 @@ class ContentOrchestrator:
                 existing_records = plan_sheet.get_all_records()
 
                 for index, row in enumerate(existing_records, start=2):
-                    try:  # ← per-row isolation: one bad row never stops the agent
+                    try:
                         if row.get("Status") != "Pending Approval":
                             continue
                         if row.get("Research_Brief"):
@@ -643,27 +602,37 @@ class ContentOrchestrator:
                             })
                         except Exception:
                             pass
-                        continue  # ← go to next row
+                        continue
 
             except Exception as e:
                 self._log("error", "Researcher", "N/A", "EXCEPTION", str(e))
 
         # ══════════════════════════════════════════════════════════════════════
         # AGENT 3 + 4: WRITER → REVIEWER LOOP
+        #
+        # ✅ FIX vs original:
+        #   - reviewer.review_draft()  (was review_content())
+        #   - param draft_text=        (was draft_html=)
+        #   - result["reviewer_summary"] (was result["notes"])
+        #   - result["violations"]       (was result["red_flags"])
+        #   - status in ("PASS","PASS_WITH_NOTES")  (was == "APPROVED")
+        #   - skip condition: checks Draft_Content exists (was Reviewer_Notes=="APPROVED")
         # ══════════════════════════════════════════════════════════════════════
         if start_from_agent <= 3:
             print("\n" + "─" * 60)
-            print("✍️  AGENT 3: WRITER  +  🛡️ AGENT 4: REVIEWER (auto-retry loop)")
+            print("✍️  AGENT 3: WRITER  +  🛡️ AGENT 4: REVIEWER (rewrite loop)")
             try:
                 existing_records = plan_sheet.get_all_records()
 
                 for index, row in enumerate(existing_records, start=2):
-                    try:  # ← per-row isolation
+                    try:
                         if row.get("Status") != "Pending Approval":
                             continue
                         if not row.get("Research_Brief"):
                             continue
-                        if row.get("Draft_Content") and row.get("Reviewer_Notes"):
+                        # ✅ FIX: skip if already written+reviewed
+                        # (Status stays "Pending Approval" until THIS loop changes it)
+                        if row.get("Draft_Content"):
                             continue
 
                         research_result = self._safe_json_parse(
@@ -673,156 +642,153 @@ class ContentOrchestrator:
                             print(f"   ⚠️  Row {index}: could not parse Research_Brief — skipping.")
                             continue
 
-                        research_status = research_result.get("status", "")
-                        if "BLOCKED" in research_status or "insufficient" in research_status:
-                            print(f"   ⚠️  Row {index}: bad research status — skipping.")
-                            continue
+                        title                     = row.get("Title", "")
+                        best_draft                = None
+                        best_reviewer_summary     = ""
+                        final_status              = "hidden"  # default: hidden if never PASS
+                        required_fixes_for_writer = []
 
-                        title          = row.get("Title", "")
-                        previous_draft = ""
-                        required_fixes = []
-                        final_writer   = None
-                        final_review   = None
-
-                                                # ── Writer → Reviewer loop ────────────────────────────
                         for attempt in range(1, max_retries + 1):
                             print(f"\n   🔄 Attempt {attempt}/{max_retries}: Writing...")
 
-                            # Ask the Writer agent to produce an HTML draft.
-                            # On retries, it receives the previous draft + a list
-                            # of specific fixes the Reviewer flagged.
-                            writer_result = writer.write_draft(
-                                content_row    = row,
+                            write_result = writer.write_draft(
+                                content_row     = row,
                                 research_result = research_result,
                                 config          = self.config,
-                                previous_draft  = previous_draft,
-                                required_fixes  = required_fixes
+                                previous_draft  = best_draft or "",
+                                required_fixes  = required_fixes_for_writer,
                             )
 
-                            # BLOCKED = a hard error (e.g. Gemini API failure).
-                            # We stop retrying this article but continue to the next row.
-                            if writer_result["status"] == "BLOCKED":
-                                self._log("error", "Writer", title, "BLOCKED",
-                                          str(writer_result.get("errors")))
-                                self.db.log_task("Writer", title, "BLOCKED",
-                                                 str(writer_result.get("errors")))
-                                break
+                            write_status = write_result.get("status", "")
 
-                            # HARD_FAIL = the draft contains serious violations
-                            # (e.g. FDA-banned phrases) that can't be auto-fixed.
-                            if writer_result["status"] == "HARD_FAIL":
-                                self._log("warning", "Writer", title, "HARD_FAIL",
-                                          str(writer_result.get("violations")))
+                            if write_status == "HARD_FAIL":
+                                print(f"   🚨 Writer HARD_FAIL on attempt {attempt} — "
+                                      f"compliance violation cannot be auto-fixed.")
+                                self._log("error", "Writer", title, "HARD_FAIL",
+                                          str(write_result.get("violations")))
                                 self.db.log_task("Writer", title, "HARD_FAIL",
-                                                 str(writer_result.get("violations")))
+                                                 str(write_result.get("violations")))
                                 break
 
-                            current_draft = writer_result.get("html", "")
-                            print(f"   ✍️  Draft written "
-                                  f"({writer_result.get('word_count', 0)} words). Reviewing...")
+                            if write_status == "BLOCKED":
+                                print(f"   🚫 Writer BLOCKED on attempt {attempt}: "
+                                      f"{write_result.get('errors')}")
+                                self._log("error", "Writer", title, "BLOCKED",
+                                          str(write_result.get("errors")))
+                                break
 
-                            # Ask the Reviewer agent to check compliance, quality,
-                            # and brand voice. It returns PASS, PASS_WITH_NOTES, or FAIL.
+                            draft = write_result.get("html", "")
+                            if draft:
+                                best_draft = draft
+
+                            # ── ✅ FIX: reviewer.review_draft() + correct param/result names ──
+                            print(f"   🛡️  Reviewer evaluating attempt {attempt}...")
                             review_result = reviewer.review_draft(
                                 content_row     = row,
-                                draft_text      = current_draft,
+                                draft_text      = draft,           # ✅ FIX: was draft_html
                                 research_result = research_result,
-                                config          = self.config
+                                config          = self.config,
                             )
 
-                            review_status = review_result.get("status", "")
-                            print(f"   🛡️  Review: {review_status}")
+                            review_status    = review_result.get("status",           "")
+                            reviewer_summary = review_result.get("reviewer_summary", "")  # ✅ FIX: was "notes"
+                            required_fixes   = review_result.get("required_fixes",   [])
+                            violations       = review_result.get("violations",        [])  # ✅ FIX: was "red_flags"
 
+                            print(f"      Reviewer: {review_status}")
+
+                            # ✅ FIX: PASS or PASS_WITH_NOTES = green flag (was == "APPROVED")
                             if review_status in ("PASS", "PASS_WITH_NOTES"):
-                                # ✅ Draft passed — save final results and exit loop
-                                final_writer = writer_result
-                                final_review = review_result
-                                print(f"   ✅ Passed on attempt {attempt}!")
+                                best_draft            = draft
+                                best_reviewer_summary = reviewer_summary
+                                final_status          = "public"
+                                print(f"   ✅ GREEN FLAG on attempt {attempt} — "
+                                      f"queued for Live/Public.")
                                 break
 
-                            # Draft failed — collect the fixes and send back to Writer
-                            required_fixes = review_result.get("required_fixes", [])
-                            previous_draft = current_draft
-                            print(f"   ↩️  {len(required_fixes)} fix(es) sent back to Writer:")
-                            for fix in required_fixes:
-                                print(f"      - {fix}")
+                            # FAIL → prepare feedback for Writer
+                            best_reviewer_summary     = reviewer_summary
+                            required_fixes_for_writer = list(required_fixes)
 
-                            # If this was the last allowed attempt, save whatever
-                            # we have and flag for manual review — don't discard the work
+                            for v in violations:
+                                fix = f"COMPLIANCE VIOLATION: {v}"
+                                if fix not in required_fixes_for_writer:
+                                    required_fixes_for_writer.append(fix)
+
+                            print(f"   🔁 {len(required_fixes_for_writer)} issue(s) found "
+                                  f"— rewriting with feedback...")
+
                             if attempt == max_retries:
-                                final_writer = writer_result
-                                final_review = review_result
-                                print("   ⚠️  Max retries reached — saving draft as 'Needs Review'.")
+                                print(f"   ⚠️  Max retries ({max_retries}) reached — "
+                                      f"will publish as Live/Hidden for review.")
 
-                        # ── Save Writer + Reviewer results to the Sheet ────────
-                        if final_writer and final_review:
-                            review_status = final_review.get("status", "FAIL")
-                            summary_note  = final_review.get("reviewer_summary", "")
-
-                            # "Content Approved" → moves forward to Optimizer
-                            # "Needs Review"     → waits for manual inspection
-                            new_status = (
-                                "Content Approved"
-                                if review_status in ("PASS", "PASS_WITH_NOTES")
-                                else "Needs Review"
-                            )
-
+                        # ── Post-loop ─────────────────────────────────────────
+                        if not best_draft:
                             self._update_cells(plan_sheet, index, {
-                                "Draft_Content":  final_writer.get("html",       ""),
-                                "WordCount":      final_writer.get("word_count",  0),
-                                "Status":         new_status,
-                                "Reviewer_Notes": summary_note
+                                "Status":         "Needs Review",
+                                "Reviewer_Notes": (
+                                    "All attempts failed (HARD_FAIL/BLOCKED) — "
+                                    "manual intervention needed."
+                                ),
                             })
-                            self._log("info", "Writer+Reviewer", title, new_status,
-                                      f"Words: {final_writer.get('word_count', 0)}")
-                            self.db.log_task(
-                                "Writer+Reviewer", title,
-                                "SUCCESS" if new_status == "Content Approved" else "NEEDS_REVIEW",
-                                summary_note
-                            )
+                            self._log("error", "Writer", title, "NO_DRAFT_PRODUCED")
+                            self.db.log_task("Writer", title, "NO_DRAFT_PRODUCED",
+                                             "No valid draft after all retries.")
+                            continue
 
-                            if test_mode:
-                                print("🛑 Test Mode: stopping after 1 article.")
-                                time.sleep(10)
-                                break
+                        self._update_cells(plan_sheet, index, {
+                            "Draft_Content":  best_draft,
+                            "WordCount":      str(len(best_draft.split())),
+                            "Reviewer_Notes": best_reviewer_summary,
+                            "Status":         "Ready_To_Publish",
+                            # ✅ Publisher reads Visibility from content_row
+                            "Visibility":     "hidden" if final_status == "hidden" else "",
+                        })
+
+                        status_label = (
+                            "APPROVED → queued for Live/Public"
+                            if final_status == "public"
+                            else f"Max retries ({max_retries}) → queued for Live/Hidden"
+                        )
+                        self._log("info", "Writer+Reviewer", title, status_label)
+                        self.db.log_task(
+                            "Writer", title,
+                            "APPROVED" if final_status == "public" else "MAX_RETRIES_HIDDEN",
+                            status_label
+                        )
+
+                        if test_mode:
+                            print("🛑 Test Mode: stopping Writer+Reviewer after 1 run.")
+                            time.sleep(10)
+                            break
 
                         time.sleep(10)
 
                     except Exception as row_e:
-                        # One row crashed — log it, mark it in the Sheet,
-                        # and continue to the next row without stopping the pipeline
                         title = row.get("Title", f"Row {index}")
-                        self._log("error", "Writer+Reviewer", title, "ROW_EXCEPTION", str(row_e))
-                        self.db.log_task("Writer+Reviewer", title, "ROW_EXCEPTION", str(row_e))
+                        self._log("error", "Writer", title, "ROW_EXCEPTION", str(row_e))
+                        self.db.log_task("Writer", title, "ROW_EXCEPTION", str(row_e))
                         try:
                             self._update_cells(plan_sheet, index, {
                                 "Reviewer_Notes": f"Pipeline error: {str(row_e)[:200]}"
                             })
                         except Exception:
                             pass
-                        continue  # ← skip to next row
+                        continue
 
             except Exception as e:
-                self._log("error", "Writer+Reviewer", "N/A", "EXCEPTION", str(e))
+                self._log("error", "Writer", "N/A", "EXCEPTION", str(e))
 
         # ══════════════════════════════════════════════════════════════════════
         # AGENT 5: OPTIMIZER
-        # Takes the approved draft and:
-        #   - Finalizes the HTML with brand styles applied
-        #   - Generates meta title, meta description, and URL slug
-        #   - Builds schema markup (structured data for Google)
-        #   - Checks word count limits from Config_Brand
         #
-        # Word count: if the draft EXCEEDS the max, the Optimizer rewrites it
-        # to fit — it does NOT throw an error. Pipeline always continues.
+        # ✅ FIX vs original:
+        #   - reads Status == "Ready_To_Publish"  (was "Content Approved" — never set)
         # ══════════════════════════════════════════════════════════════════════
         if start_from_agent <= 5:
             print("\n" + "─" * 60)
             print("⚙️  AGENT 5: OPTIMIZER")
 
-            # Load non-blocking warning types from Agent_Rules.
-            # These warnings are logged but will NOT stop the post from publishing.
-            # Example: "Internal link inventory unavailable" — not critical.
             non_blocking_raw      = self._get_rule(
                 "orchestrator", "non_blocking_warnings",
                 default="Internal link inventory unavailable,schema_type missing"
@@ -835,19 +801,17 @@ class ContentOrchestrator:
                 existing_records = plan_sheet.get_all_records()
 
                 for index, row in enumerate(existing_records, start=2):
-                    try:  # ← per-row isolation: one crash doesn't stop all posts
-                        if row.get("Status") != "Content Approved":
+                    try:
+                        # ✅ FIX: "Ready_To_Publish" is what Agent 3+4 writes
+                        if row.get("Status") != "Ready_To_Publish":
                             continue
                         if not row.get("Draft_Content"):
                             continue
-                        # Skip if already optimized (prevents re-running on same row)
                         if row.get("Optimized_Draft"):
                             continue
 
                         title = row.get("Title", "")
 
-                        # Build a minimal reviewer_result dict so the Optimizer
-                        # knows the review passed (it uses this for context)
                         reviewer_result = {
                             "status":           "PASS",
                             "reviewer_summary": row.get("Reviewer_Notes", "Approved")
@@ -862,7 +826,6 @@ class ContentOrchestrator:
                         status = optimizer_result.get("status", "")
 
                         if status == "BLOCKED":
-                            # A hard failure (e.g. Gemini error) — log and skip this row
                             self._update_cells(plan_sheet, index, {
                                 "Reviewer_Notes": "; ".join(optimizer_result.get("errors", []))
                             })
@@ -872,27 +835,24 @@ class ContentOrchestrator:
                                              str(optimizer_result.get("errors")))
 
                         else:
-                            # Separate blocking warnings (need human review)
-                            # from non-blocking ones (just informational)
                             all_warnings      = optimizer_result.get("warnings", [])
                             blocking_warnings = [
                                 w for w in all_warnings
                                 if not any(nb in w for nb in non_blocking_warnings)
                             ]
 
-                            # "Ready to Publish" → Publisher can pick it up next
-                            # "Needs Review"     → a human needs to check it first
+                            # "Ready to Publish" → Publisher picks it up
+                            # "Needs Review"     → human must check first
                             new_status = "Ready to Publish" if not blocking_warnings else "Needs Review"
 
                             self._update_cells(plan_sheet, index, {
                                 "Status":          new_status,
-                                "Optimized_Draft": optimizer_result.get("html",             ""),
-                                "Schema":          optimizer_result.get("schema",            ""),
-                                "MetaTitle":       optimizer_result.get("meta_title",        ""),
-                                "MetaDescription": optimizer_result.get("meta_description",  ""),
-                                "UrlSlug":         optimizer_result.get("url_slug",          ""),
+                                "Optimized_Draft": optimizer_result.get("html",            ""),
+                                "Schema":          optimizer_result.get("schema",           ""),
+                                "MetaTitle":       optimizer_result.get("meta_title",       ""),
+                                "MetaDescription": optimizer_result.get("meta_description", ""),
+                                "UrlSlug":         optimizer_result.get("url_slug",         ""),
                                 "WordCount":       optimizer_result.get("word_count",        ""),
-                                # Keep any pre-existing notes if Optimizer has none
                                 "Reviewer_Notes":  "; ".join(all_warnings)
                                                    or row.get("Reviewer_Notes", "")
                             })
@@ -909,7 +869,6 @@ class ContentOrchestrator:
                         time.sleep(10)
 
                     except Exception as row_e:
-                        # Row-level crash — log, mark in Sheet, continue to next row
                         title = row.get("Title", f"Row {index}")
                         self._log("error", "Optimizer", title, "ROW_EXCEPTION", str(row_e))
                         self.db.log_task("Optimizer", title, "ROW_EXCEPTION", str(row_e))
@@ -927,30 +886,18 @@ class ContentOrchestrator:
         # ══════════════════════════════════════════════════════════════════════
         # AGENT 6: PUBLISHER
         #
-        # FAIL-SAFE DESIGN — this agent ALWAYS tries to publish something:
-        #
-        #   ✅ No red flags  →  published LIVE    →  standard Telegram notification
-        #   ⚠️ Red flags     →  published HIDDEN  →  Telegram ⚠️ alert with reason
-        #   ❌ Shopify error →  nothing uploaded  →  error logged, NO Telegram sent
-        #                                             (there's nothing to review)
-        #
-        # "Red flags" = the Reviewer_Notes column has content AND the reviewer
-        # rule "publish_hidden_on_warning" is TRUE in Agent_Rules.
-        #
-        # Telegram is sent ONLY when the post is confirmed live in Shopify.
-        # ChromaDB always saves after a successful upload — hidden or live —
-        # so the Planner won't generate duplicate topics in the future.
+        # ✅ FIX vs original:
+        #   - Visibility ya fue escrita en el Sheet por Agent 3+4
+        #     → Publisher lee content_row["Visibility"] directamente
+        #     → No recomputar force_hidden desde Reviewer_Notes aquí
+        #   - pub_status == "Live" (publisher.py siempre retorna "Live")
+        #   - Usa publish_result["is_hidden"] para decidir Telegram + Sheet labels
+        #   - ChromaDB save siempre ocurre en Orchestrator (hidden o public)
         # ══════════════════════════════════════════════════════════════════════
         if start_from_agent <= 6:
             print("\n" + "─" * 60)
             print("🚀 AGENT 6: PUBLISHER")
 
-            # Read publisher-specific rules from Agent_Rules tab
-            # publish_hidden_on_warning: if TRUE, posts with red flags go hidden
-            publish_hidden_on_warning = self._get_rule(
-                "publisher", "publish_hidden_on_warning", default=True
-            )
-            # telegram_on_hidden: if TRUE, sends a Telegram alert for hidden posts
             telegram_on_hidden = self._get_rule(
                 "publisher", "telegram_on_hidden", default=True
             )
@@ -959,32 +906,24 @@ class ContentOrchestrator:
                 existing_records = plan_sheet.get_all_records()
 
                 for index, row in enumerate(existing_records, start=2):
-                    try:  # ← per-row isolation
+                    try:
                         if row.get("Status") != "Ready to Publish":
                             continue
                         if not row.get("Optimized_Draft"):
                             continue
-                        # Skip rows already published (prevents re-uploading)
                         if row.get("Published_Status"):
                             continue
 
                         title = row.get("Title", "")
 
-                        # Determine if this post has red flags.
-                        # A red flag = Reviewer_Notes is not empty after optimization.
-                        has_red_flags = bool(row.get("Reviewer_Notes", "").strip())
+                        # ✅ FIX: Visibility ya está en el Sheet desde Agent 3+4
+                        # No recomputar — leer directo de la fila
+                        visibility_from_sheet = str(row.get("Visibility", "")).strip().lower()
+                        is_hidden_pre         = visibility_from_sheet == "hidden"
 
-                        # Decide visibility BEFORE calling the Publisher agent.
-                        # This gives the Publisher agent explicit instructions.
-                        force_hidden = has_red_flags and publish_hidden_on_warning
-                        visibility   = "hidden" if force_hidden else "live"
+                        if is_hidden_pre:
+                            print(f"   ⚠️  Visibility=hidden — publishing as Live/Hidden.")
 
-                        if force_hidden:
-                            print(f"   ⚠️  Red flags found — will publish as HIDDEN.")
-                            print(f"   Reason: {row.get('Reviewer_Notes', '')[:100]}")
-
-                        # Build the optimizer_result dict the Publisher expects.
-                        # We read the data from the Sheet row (already saved by Optimizer).
                         optimizer_result = {
                             "status":           "Ready for Approval",
                             "html":             row.get("Optimized_Draft",   ""),
@@ -994,11 +933,10 @@ class ContentOrchestrator:
                             "url_slug":         row.get("UrlSlug",           ""),
                             "word_count":       row.get("WordCount",          0),
                             "warnings":         [],
-                            # Pass the visibility decision so Publisher
-                            # sets published=false in Shopify when needed
-                            "visibility":       visibility
                         }
 
+                        # content_row passed to Publisher already has Visibility
+                        # from the Sheet — Publisher reads it directly
                         publish_result = publisher.publish_post(
                             content_row      = row,
                             optimizer_result = optimizer_result,
@@ -1006,7 +944,7 @@ class ContentOrchestrator:
                         )
                         pub_status = publish_result.get("status", "")
 
-                        # ── Case 1: Upload FAILED (never reached Shopify) ──────
+                        # ── Case 1: Upload FAILED ──────────────────────────────
                         if pub_status in ("BLOCKED", "FAILED"):
                             error_note = "; ".join(
                                 publish_result.get("errors",   []) +
@@ -1017,62 +955,55 @@ class ContentOrchestrator:
                             })
                             self._log("error", "Publisher", title, pub_status, error_note)
                             self.db.log_task("Publisher", title, pub_status, error_note)
-                            # ⚠️ NO Telegram — the post is not in Shopify,
-                            # there's nothing to review there
                             print(f"   ❌ Upload failed — no Telegram sent.")
 
                         # ── Case 2: Upload SUCCEEDED ───────────────────────────
+                        # ✅ FIX: pub_status == "Live" (publisher always returns "Live")
                         else:
-                            admin_url    = publish_result.get("admin_url", "")
+                            admin_url    = publish_result.get("admin_url",  "")
+                            is_hidden    = publish_result.get("is_hidden",  False)  # ✅ FIX
+                            hidden_reason= publish_result.get("hidden_reason", "")
                             warning_note = "; ".join(publish_result.get("warnings", []))
 
-                            # "Live (Hidden)" → in Shopify but not visible to visitors
-                            # "Live"          → fully visible on the blog
-                            final_status    = "Live (Hidden)" if force_hidden else "Live"
-                            published_label = "Hidden - Needs Review" if force_hidden else "Draft Created"
+                            # ✅ FIX: Sheet labels use is_hidden from Publisher result
+                            sheet_status     = "Live (Hidden)" if is_hidden else "Live"
+                            published_label  = "Hidden - Needs Review" if is_hidden else "Live"
 
                             self._update_cells(plan_sheet, index, {
-                                "Status":           final_status,
+                                "Status":           sheet_status,
                                 "Published_Status": published_label,
                                 "AdminURL":         admin_url,
-                                # Keep the original red flag note if no new warnings
                                 "Reviewer_Notes":   warning_note or row.get("Reviewer_Notes", ""),
-                                # Log which visibility was used for audit trail
-                                "Visibility":       visibility
+                                "Visibility":       "hidden" if is_hidden else "public",
                             })
-                            self._log("info", "Publisher", title, final_status, admin_url)
+                            self._log("info", "Publisher", title, sheet_status, admin_url)
                             self.db.log_task("Publisher", title, "SUCCESS",
-                                             f"{final_status} → {admin_url}")
+                                             f"{sheet_status} → {admin_url}")
 
-                            # ── Save to ChromaDB memory ────────────────────────
-                            # Always save — hidden OR live. Reason: the post exists
-                            # in Shopify now, so the Planner should not write about
-                            # the same topic again, regardless of visibility.
+                            # ── ChromaDB: always save (hidden or live) ─────────
+                            # Post exists in Shopify → Planner should not re-generate it
                             if self.chroma:
                                 try:
                                     self.chroma.save_post({
                                         "title":          title,
-                                        "url_slug":       row.get("UrlSlug",       ""),
-                                        "keyword":        row.get("Keyword",        ""),
-                                        "section":        row.get("Section",        ""),
-                                        "summary":        row.get("Summary",        ""),
-                                        "published_date": row.get("ScheduledDate",  ""),
+                                        "url_slug":       row.get("UrlSlug",      ""),
+                                        "keyword":        row.get("Keyword",       ""),
+                                        "section":        row.get("Section",       ""),
+                                        "summary":        row.get("Summary",       ""),
+                                        "published_date": row.get("ScheduledDate", ""),
                                         "admin_url":      admin_url,
                                     })
                                     print("   🧠 Saved to ChromaDB memory.")
                                 except Exception as chroma_e:
-                                    # ChromaDB failure never blocks publishing
                                     print(f"   ⚠️  ChromaDB save failed (non-critical): {chroma_e}")
 
-                            # ── Send Telegram notification ─────────────────────
-                            # Hidden post → alert with reason (so you can review it)
-                            # Live post   → standard success notification
-                            if force_hidden and telegram_on_hidden:
+                            # ── Telegram ───────────────────────────────────────
+                            if is_hidden and telegram_on_hidden:
                                 self.send_telegram_alert(
                                     title     = title,
                                     admin_url = admin_url,
                                     hidden    = True,
-                                    reason    = row.get("Reviewer_Notes", "Red flags detected")
+                                    reason    = hidden_reason or row.get("Reviewer_Notes", "")
                                 )
                             else:
                                 self.send_telegram_alert(
@@ -1086,8 +1017,6 @@ class ContentOrchestrator:
                                 break
 
                     except Exception as row_e:
-                        # Row-level crash — log, mark in Sheet, continue to next row.
-                        # Even if one post's upload crashes, others still get published.
                         title = row.get("Title", f"Row {index}")
                         self._log("error", "Publisher", title, "ROW_EXCEPTION", str(row_e))
                         self.db.log_task("Publisher", title, "ROW_EXCEPTION", str(row_e))
@@ -1097,7 +1026,7 @@ class ContentOrchestrator:
                             })
                         except Exception:
                             pass
-                        continue  # ← keep publishing remaining posts
+                        continue
 
             except Exception as e:
                 self._log("error", "Publisher", "N/A", "EXCEPTION", str(e))
@@ -1110,12 +1039,6 @@ class ContentOrchestrator:
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
-# This block runs only when you execute the file directly:
-#   python orchestrator.py
-# It does NOT run when another file imports this module.
 if __name__ == "__main__":
     bot = ContentOrchestrator(sheet_name="Blog_agent_ai")
-    # start_from_agent=1 → runs all agents (1 through 6)
-    # start_from_agent=5 → skips to Optimizer (useful for testing)
-    # start_from_agent=6 → skips directly to Publisher
     bot.run(start_from_agent=1)

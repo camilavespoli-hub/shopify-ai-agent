@@ -3,7 +3,7 @@ import re
 import json
 import requests
 from google import genai
-from duckduckgo_search import DDGS
+from ddgs import DDGS
 from datetime import datetime
 
 

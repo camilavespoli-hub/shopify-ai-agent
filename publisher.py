@@ -98,21 +98,16 @@ class PublisherAgent:
         Output : structured dict with status, shopify_id, admin_url
 
         Key behaviours:
-        - Credentials validated in __init__, not at module import time
-        - JSON-LD schema prepended to HTML before publish
-        - SEO title + description sent via metafields (global namespace)
-          — "seo" is not a valid ArticleCreateInput field
-        - image.url used (not image.src — invalid field name in Shopify API)
-        - summary and tags fields populated from content_row
-        - ChromaDB memory updated via optimizer_agent.add_to_memory()
-          after every successful publish
+        - ALWAYS publishes as isPublished=True — never Draft
+        - Visibility="hidden" → published Live but tagged "needs-review"
+        - Visibility=""/"public" → published Live as Public
+        - ChromaDB memory only updated for Public articles
+        - Orchestrator reads is_hidden to update Sheet + send Telegram
         """
         print("🔌 Initializing Shopify Publisher Agent...")
-        # ✅ FIX: consistent default with Reviewer and Optimizer
         self.config          = config or {"brand": {}, "system": {}}
         self.optimizer_agent = optimizer_agent
 
-        # ── Credentials — same vars as .env ──────────────────────────
         self.shop          = os.getenv("SHOPIFY_SHOP")
         self.client_id     = os.getenv("SHOPIFY_CLIENT_ID")
         self.client_secret = os.getenv("SHOPIFY_CLIENT_SECRET")
@@ -124,7 +119,6 @@ class PublisherAgent:
                 "and SHOPIFY_CLIENT_SECRET environment variables."
             )
 
-        # ── Token cache ──────────────────────────────────────────────
         self._token            = None
         self._token_expires_at = 0.0
 
@@ -160,7 +154,6 @@ class PublisherAgent:
             payload["variables"] = variables
 
         response = requests.post(
-            # ✅ FIX: API version 2024-04 — consistent with Optimizer
             f"https://{self.shop}.myshopify.com/admin/api/2024-04/graphql.json",
             headers={
                 "Content-Type":           "application/json",
@@ -204,12 +197,10 @@ class PublisherAgent:
                 print(f"   📂 Blog matched: '{node['title']}' (handle: {node['handle']})")
                 return node["id"]
 
-        # No direct match — log available blogs
         available = [f"'{e['node']['title']}' ({e['node']['handle']})" for e in edges]
         print(f"   ⚠️ No blog matching '{section_name}' found.")
         print(f"   Available blogs: {', '.join(available)}")
 
-        # Try default_section from Config_Brand before falling back to first blog
         default_section = self.config.get("brand", {}).get("default_section", "")
         if default_section:
             default_handle = default_section.lower().replace(" ", "-")
@@ -220,10 +211,8 @@ class PublisherAgent:
                     print(f"   📂 Using default_section fallback: '{node['title']}'")
                     return node["id"]
 
-        # Last resort — first blog in Shopify
         print(f"   ⚠️ Using last-resort fallback: '{edges[0]['node']['title']}'")
         return edges[0]["node"]["id"]
-
 
 
     # ── TOOL 2: Featured Image ───────────────────────────────────────────
@@ -232,9 +221,7 @@ class PublisherAgent:
         Fetches a landscape stock image from Pexels.
         Returns (url, alt_text) — falls back to placeholder gracefully.
         """
-        fallback_url = (
-            "https://via.placeholder.com/800x600.png?text=Glomend+Wellness"
-        )
+        fallback_url = "https://via.placeholder.com/800x600.png?text=Glomend+Wellness"
         fallback_alt = "Glomend women's wellness"
 
         if not self.pexels_key:
@@ -290,17 +277,19 @@ class PublisherAgent:
 
         Args:
             content_row      : dict — Title, Section, Keyword, Summary,
-                               ScheduledDate from Content_Plan
+                               ScheduledDate, Visibility from Content_Plan
             optimizer_result : dict — html, meta_title, meta_description,
                                url_slug, schema, word_count, status
                                from OptimizerAgent
 
         Returns:
             dict — {
-                status        : "Draft Created" | "BLOCKED" | "FAILED",
-                shopify_id    : str  — raw Shopify article GID,
-                admin_url     : str  — direct Admin link for editorial review,
-                article_handle: str  — storefront URL handle,
+                status        : "Live" | "BLOCKED" | "FAILED",
+                shopify_id    : str,
+                admin_url     : str,
+                article_handle: str,
+                is_hidden     : bool  — True if published as hidden/needs-review,
+                hidden_reason : str   — why it was hidden (empty if public),
                 warnings      : [str],
                 errors        : [str]
             }
@@ -324,6 +313,8 @@ class PublisherAgent:
                 "shopify_id":     "",
                 "admin_url":      "",
                 "article_handle": "",
+                "is_hidden":      False,
+                "hidden_reason":  "",
                 "warnings":       validation["warnings"],
                 "errors":         validation["errors"]
             }
@@ -333,17 +324,23 @@ class PublisherAgent:
                 print(f"   ⚠ {w}")
 
         # ── Step 2: Gather publish data ──────
-        brand        = config.get("brand", {})
-        default_section = config.get("brand", {}).get("default_section", "")
+        brand           = config.get("brand", {})
+        default_section = brand.get("default_section", "")
         section_name    = content_row.get("Section", "") or default_section
-        keyword      = content_row.get("Keyword",  title)
-        summary      = content_row.get("Summary",  "")
-        author_name  = brand.get("default_author_name", "Glomend Editorial Team")
+        keyword         = content_row.get("Keyword",  title)
+        summary         = content_row.get("Summary",  "")
+        author_name     = brand.get("default_author_name", "Glomend Editorial Team")
 
-        # Visibility — controlled from Content_Plan sheet (col Visibility)
-        visibility = content_row.get("Visibility") or \
-            config.get("brand", {}).get("default_visibility", "Public")
-        is_public  = visibility.strip().lower() == "public"
+        # ✅ FIX: Visibility viene del loop Writer+Reviewer en el orchestrator.
+        # "hidden"  → Writer agotó retries → publicar Live pero como hidden
+        # "" / None → APPROVED              → publicar Live como Public
+        # SIEMPRE isPublished=True — nunca Draft en Shopify
+        visibility_raw = str(content_row.get("Visibility", "")).strip().lower()
+        is_hidden      = visibility_raw == "hidden"
+        hidden_reason  = (
+            "Max retries reached — content has unresolved reviewer flags."
+            if is_hidden else ""
+        )
 
         html_content = optimizer_result.get("html",             "")
         schema_block = optimizer_result.get("schema",           "")
@@ -353,8 +350,7 @@ class PublisherAgent:
 
         if url_slug:
             url_slug = re.sub(
-                r'[^a-z0-9-]',
-                '',
+                r'[^a-z0-9-]', '',
                 url_slug.lower().replace(" ", "-")
             )
 
@@ -374,6 +370,8 @@ class PublisherAgent:
                 "shopify_id":     "",
                 "admin_url":      "",
                 "article_handle": "",
+                "is_hidden":      False,
+                "hidden_reason":  "",
                 "warnings":       validation["warnings"],
                 "errors":         [f"Blog lookup failed: {str(e)}"]
             }
@@ -411,11 +409,10 @@ class PublisherAgent:
                 "type":      "single_line_text_field"
             })
 
-        tags = [
-            t.strip()
-            for t in keyword.split(",")
-            if t.strip()
-        ][:5]
+        # ✅ FIX: base tags del keyword + "needs-review" si es hidden
+        tags = [t.strip() for t in keyword.split(",") if t.strip()][:5]
+        if is_hidden:
+            tags.append("needs-review")
 
         variables = {
             "article": {
@@ -423,7 +420,7 @@ class PublisherAgent:
                 "body":        final_body,
                 "blogId":      blog_id,
                 "author":      {"name": author_name},
-                "isPublished": is_public,
+                "isPublished": True,          # ✅ SIEMPRE True — nunca Draft
                 "summary":     summary[:500] if summary else "",
                 "tags":        tags,
                 **({"handle": url_slug} if url_slug else {}),
@@ -436,7 +433,8 @@ class PublisherAgent:
         }
 
         # ── Step 7: Publish to Shopify ───────
-        print(f"   📤 Pushing '{title}' to Shopify...")
+        live_label = "Live/Hidden (needs-review)" if is_hidden else "Live/Public"
+        print(f"   📤 Pushing '{title}' to Shopify as {live_label}...")
         try:
             result = self._graphql(mutation, variables)
         except Exception as e:
@@ -446,6 +444,8 @@ class PublisherAgent:
                 "shopify_id":     "",
                 "admin_url":      "",
                 "article_handle": "",
+                "is_hidden":      False,
+                "hidden_reason":  "",
                 "warnings":       validation["warnings"],
                 "errors":         [f"GraphQL publish failed: {str(e)}"]
             }
@@ -460,6 +460,8 @@ class PublisherAgent:
                 "shopify_id":     "",
                 "admin_url":      "",
                 "article_handle": "",
+                "is_hidden":      False,
+                "hidden_reason":  "",
                 "warnings":       validation["warnings"],
                 "errors":         [f"Shopify userError: {msg}"]
             }
@@ -472,17 +474,22 @@ class PublisherAgent:
             f"https://{self.shop}.myshopify.com"
             f"/admin/articles/{clean_id}"
         )
-        print(f"   ✅ Draft created: {admin_url}")
 
         # ── Step 9: Update ChromaDB memory ───
-        if self.optimizer_agent and summary:
+        # Solo para artículos Public — los hidden no deben influir
+        # en la detección de duplicados hasta que sean aprobados
+        if self.optimizer_agent and summary and not is_hidden:
             blog_handle    = section_name.lower().replace(" ", "-")
             storefront_url = f"/blogs/{blog_handle}/{handle}"
             self.optimizer_agent.add_to_memory(title, summary, storefront_url)
+        elif is_hidden:
+            validation["warnings"].append(
+                "ChromaDB memory NOT updated — article published as Hidden. "
+                "Update manually after editorial review."
+            )
         elif not summary:
             validation["warnings"].append(
-                "NEEDS REVIEW: ChromaDB memory NOT updated — "
-                "Summary was missing from content_row."
+                "ChromaDB memory NOT updated — Summary was missing."
             )
 
         # ── Step 10: Build final warnings ────
@@ -494,19 +501,23 @@ class PublisherAgent:
             )
 
         # ── Step 11: Report ──────────────────
-        print(f"✅ Publish complete.")
-        print(f"   Status     : Draft Created")
+        print(f"✅ Published: {live_label}")
         print(f"   Admin URL  : {admin_url}")
         print(f"   Handle     : {handle}")
-        if final_warnings:
-            for w in final_warnings:
-                print(f"   ⚠ {w}")
+        if is_hidden:
+            print(f"   ⚠️  Reason   : {hidden_reason}")
+        for w in final_warnings:
+            print(f"   ⚠ {w}")
 
+        # ✅ FIX: status siempre "Live"
+        # El orchestrator usa is_hidden para Sheet + Telegram
         return {
-            "status":         "Draft Created",
+            "status":         "Live",
             "shopify_id":     raw_id,
             "admin_url":      admin_url,
             "article_handle": handle,
+            "is_hidden":      is_hidden,
+            "hidden_reason":  hidden_reason,
             "warnings":       final_warnings,
             "errors":         []
         }
@@ -516,18 +527,19 @@ class PublisherAgent:
 # STANDALONE TEST
 # ─────────────────────────────────────────────
 
-
 if __name__ == "__main__":
     from dotenv import load_dotenv
     load_dotenv()
 
+    # Test 1: APPROVED → Live/Public
     agent = PublisherAgent()
     result = agent.publish_post(
         content_row = {
-            "Title":   "Why Does Perimenopause Cause Night Sweats?",
-            "Section": "News",
-            "Keyword": "perimenopause night sweats",
-            "Summary": "Explains how estrogen fluctuations affect the hypothalamus."
+            "Title":      "Why Does Perimenopause Cause Night Sweats?",
+            "Section":    "Sleep",
+            "Keyword":    "perimenopause night sweats",
+            "Summary":    "Explains how estrogen fluctuations affect the hypothalamus.",
+            "Visibility": ""       # ← vacío = Public
         },
         optimizer_result = {
             "status":           "Ready for Approval",
@@ -540,3 +552,24 @@ if __name__ == "__main__":
         }
     )
     print(result)
+
+    # Test 2: Max retries → Live/Hidden
+    result_hidden = agent.publish_post(
+        content_row = {
+            "Title":      "How Cortisol Affects Sleep in Perimenopause",
+            "Section":    "Sleep",
+            "Keyword":    "cortisol sleep perimenopause",
+            "Summary":    "Explains cortisol and sleep disruption.",
+            "Visibility": "hidden"  # ← hidden = necesita revisión
+        },
+        optimizer_result = {
+            "status":           "Ready for Approval",
+            "html":             "<p>Test article body.</p>",
+            "schema":           "",
+            "meta_title":       "Cortisol and Sleep | Glomend",
+            "meta_description": "How cortisol disrupts sleep during perimenopause.",
+            "url_slug":         "cortisol-sleep-perimenopause",
+            "word_count":       900
+        }
+    )
+    print(result_hidden)
