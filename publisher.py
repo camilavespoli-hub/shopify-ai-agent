@@ -8,16 +8,10 @@ import requests
 # INPUT VALIDATOR
 # ─────────────────────────────────────────────
 
-
 def validate_publisher_inputs(content_row, optimizer_result, config):
-    """
-    Hard-gate validation before publishing.
-    Returns {"valid": bool, "errors": [], "warnings": []}
-    """
     errors   = []
     warnings = []
 
-    # 1. Optimizer result must be a passing dict
     if not optimizer_result or not isinstance(optimizer_result, dict):
         errors.append(
             "optimizer_result must be a dict from OptimizerAgent. "
@@ -51,7 +45,6 @@ def validate_publisher_inputs(content_row, optimizer_result, config):
                 "Shopify will auto-generate a handle."
             )
 
-    # 2. Content row fields
     if not content_row.get("Title"):
         errors.append("Title is required in content_row.")
     if not content_row.get("Section"):
@@ -68,16 +61,28 @@ def validate_publisher_inputs(content_row, optimizer_result, config):
             "Summary missing — ChromaDB memory will not be updated after publish."
         )
 
-    # 3. Config
     brand = config.get("brand", {})
     if not brand.get("default_author_name"):
         warnings.append(
             "default_author_name missing from Config_Brand — "
             "defaulting to 'Glomend Editorial Team'."
         )
-    if not os.getenv("PEXELS_API_KEY"):
+
+    # ✅ Updated: warn if BOTH image sources are missing
+    has_pexels   = bool(os.getenv("PEXELS_API_KEY"))
+    has_unsplash = bool(os.getenv("UNSPLASH_ACCESS_KEY"))
+    if not has_pexels and not has_unsplash:
         warnings.append(
-            "PEXELS_API_KEY not set — featured image will use placeholder."
+            "Neither PEXELS_API_KEY nor UNSPLASH_ACCESS_KEY is set — "
+            "featured image will use placeholder."
+        )
+    elif not has_pexels:
+        warnings.append(
+            "PEXELS_API_KEY not set — image source will be Unsplash only."
+        )
+    elif not has_unsplash:
+        warnings.append(
+            "UNSPLASH_ACCESS_KEY not set — no image fallback available if Pexels fails."
         )
 
     return {"valid": len(errors) == 0, "errors": errors, "warnings": warnings}
@@ -87,23 +92,9 @@ def validate_publisher_inputs(content_row, optimizer_result, config):
 # MAIN AGENT CLASS
 # ─────────────────────────────────────────────
 
-
 class PublisherAgent:
+
     def __init__(self, config=None, optimizer_agent=None):
-        """
-        Agent 6: Shopify Publisher.
-
-        Tools  : Shopify Admin GraphQL API, Pexels Image API
-        Input  : structured dicts from OptimizerAgent + Content_Plan row
-        Output : structured dict with status, shopify_id, admin_url
-
-        Key behaviours:
-        - ALWAYS publishes as isPublished=True — never Draft
-        - Visibility="hidden" → published Live but tagged "needs-review"
-        - Visibility=""/"public" → published Live as Public
-        - ChromaDB memory only updated for Public articles
-        - Orchestrator reads is_hidden to update Sheet + send Telegram
-        """
         print("🔌 Initializing Shopify Publisher Agent...")
         self.config          = config or {"brand": {}, "system": {}}
         self.optimizer_agent = optimizer_agent
@@ -112,6 +103,7 @@ class PublisherAgent:
         self.client_id     = os.getenv("SHOPIFY_CLIENT_ID")
         self.client_secret = os.getenv("SHOPIFY_CLIENT_SECRET")
         self.pexels_key    = os.getenv("PEXELS_API_KEY")
+        self.unsplash_key  = os.getenv("UNSPLASH_ACCESS_KEY")   # ✅ NEW
 
         if not self.shop or not self.client_id or not self.client_secret:
             raise RuntimeError(
@@ -123,9 +115,8 @@ class PublisherAgent:
         self._token_expires_at = 0.0
 
 
-    # ── AUTH: Get / Refresh Token ────────────────────────────────────────
+    # ── AUTH ─────────────────────────────────────────────────────────────
     def _get_token(self):
-        """Returns a valid Shopify access token, refreshing if expired."""
         if self._token and time.time() < self._token_expires_at - 60:
             return self._token
 
@@ -146,9 +137,8 @@ class PublisherAgent:
         return self._token
 
 
-    # ── CORE: GraphQL Dispatcher ─────────────────────────────────────────
+    # ── GRAPHQL ──────────────────────────────────────────────────────────
     def _graphql(self, query, variables=None):
-        """Sends a GraphQL request to the Shopify Admin API."""
         payload = {"query": query}
         if variables:
             payload["variables"] = variables
@@ -174,11 +164,6 @@ class PublisherAgent:
 
     # ── TOOL 1: Find Blog ID ─────────────────────────────────────────────
     def _get_blog_id_by_name(self, section_name):
-        """
-        Finds the Shopify Blog ID matching section_name.
-        Logs a clear warning before falling back to the first blog —
-        never fails silently.
-        """
         query = "{ blogs(first: 10) { edges { node { id title handle } } } }"
         data  = self._graphql(query)
         edges = data.get("blogs", {}).get("edges", [])
@@ -215,25 +200,19 @@ class PublisherAgent:
         return edges[0]["node"]["id"]
 
 
-    # ── TOOL 2: Featured Image ───────────────────────────────────────────
-    def _get_featured_image(self, keyword):
+    # ── TOOL 2a: Pexels Search ───────────────────────────────────────────
+    def _search_pexels(self, search_term: str) -> tuple:
         """
-        Fetches a landscape stock image from Pexels.
-        Returns (url, alt_text) — falls back to placeholder gracefully.
+        Returns (url, alt_text) from Pexels or (None, None) if not found.
         """
-        fallback_url = "https://via.placeholder.com/800x600.png?text=Glomend+Wellness"
-        fallback_alt = "Glomend women's wellness"
-
-        if not self.pexels_key:
-            print("   ⚠️ No PEXELS_API_KEY — using placeholder image.")
-            return fallback_url, fallback_alt
-
-        search_term = keyword or "women wellness perimenopause"
         try:
             response = requests.get(
                 "https://api.pexels.com/v1/search",
-                params={"query": search_term, "per_page": 1,
-                        "orientation": "landscape"},
+                params={
+                    "query":       search_term,
+                    "per_page":    1,
+                    "orientation": "landscape"
+                },
                 headers={"Authorization": self.pexels_key},
                 timeout=10
             )
@@ -242,20 +221,84 @@ class PublisherAgent:
                 if photos:
                     url = photos[0]["src"]["large"]
                     alt = photos[0].get("alt", search_term)
-                    print(f"   🖼️ Image found: {url[:60]}...")
+                    print(f"   🖼️  [Pexels] Image found: {url[:60]}...")
                     return url, alt
+            print(f"   ⚠️  Pexels: no results for '{search_term}'.")
         except Exception as e:
-            print(f"   ⚠️ Pexels image search failed: {e}")
+            print(f"   ⚠️  Pexels error: {e}")
+        return None, None
 
+
+    # ── TOOL 2b: Unsplash Search ─────────────────────────────────────────
+    def _search_unsplash(self, search_term: str) -> tuple:
+        """
+        Returns (url, alt_text) from Unsplash or (None, None) if not found.
+        Rate limit: 50 req/hour on free tier.
+        """
+        try:
+            response = requests.get(
+                "https://api.unsplash.com/search/photos",
+                params={
+                    "query":          search_term,
+                    "per_page":       1,
+                    "orientation":    "landscape",
+                    "content_filter": "high"   # safe content only
+                },
+                headers={"Authorization": f"Client-ID {self.unsplash_key}"},
+                timeout=10
+            )
+            if response.status_code == 200:
+                results = response.json().get("results", [])
+                if results:
+                    photo = results[0]
+                    url   = photo["urls"]["regular"]
+                    alt   = photo.get("alt_description") or search_term
+                    print(f"   🖼️  [Unsplash] Image found: {url[:60]}...")
+                    return url, alt
+            print(f"   ⚠️  Unsplash: no results for '{search_term}'.")
+        except Exception as e:
+            print(f"   ⚠️  Unsplash error: {e}")
+        return None, None
+
+
+    # ── TOOL 2: Featured Image (Pexels → Unsplash → placeholder) ─────────
+    def _get_featured_image(self, keyword: str) -> tuple:
+        """
+        Tries Pexels first, falls back to Unsplash, then placeholder.
+        Returns (url, alt_text) — never raises.
+        """
+        brand        = self.config.get("brand", {})
+        brand_name   = brand.get("brand_name", "Glomend")
+        fallback_url = f"https://via.placeholder.com/800x600.png?text={brand_name}+Wellness"
+        fallback_alt = f"{brand_name} women's wellness"
+
+        search_term = keyword or "women wellness perimenopause"
+
+        # ── Attempt 1: Pexels ─────────────────
+        if self.pexels_key:
+            url, alt = self._search_pexels(search_term)
+            if url:
+                return url, alt
+            print("   🔄 Falling back to Unsplash...")
+        else:
+            print("   ⚠️  No PEXELS_API_KEY — skipping Pexels.")
+
+        # ── Attempt 2: Unsplash ───────────────
+        if self.unsplash_key:
+            url, alt = self._search_unsplash(search_term)
+            if url:
+                return url, alt
+            print("   ⚠️  Unsplash also returned no results.")
+        else:
+            print("   ⚠️  No UNSPLASH_ACCESS_KEY — skipping Unsplash.")
+
+        # ── Attempt 3: Placeholder ────────────
+        print(f"   🖼️  Using placeholder image.")
         return fallback_url, fallback_alt
 
 
     # ── TOOL 3: Schema + HTML Assembly ──────────────────────────────────
     def _assemble_body(self, html_content, schema_block):
-        """
-        Prepends JSON-LD schema <script> blocks to the article HTML.
-        Returns html_content unchanged if schema_block is empty.
-        """
         if not schema_block or not schema_block.strip():
             return html_content
 
@@ -272,58 +315,29 @@ class PublisherAgent:
 
     # ── MAIN: publish_post ───────────────────────────────────────────────
     def publish_post(self, content_row, optimizer_result, config=None):
-        """
-        Full publish pipeline for one Content_Plan row.
-
-        Args:
-            content_row      : dict — Title, Section, Keyword, Summary,
-                               ScheduledDate, Visibility from Content_Plan
-            optimizer_result : dict — html, meta_title, meta_description,
-                               url_slug, schema, word_count, status
-                               from OptimizerAgent
-
-        Returns:
-            dict — {
-                status        : "Live" | "BLOCKED" | "FAILED",
-                shopify_id    : str,
-                admin_url     : str,
-                article_handle: str,
-                is_hidden     : bool  — True if published as hidden/needs-review,
-                hidden_reason : str   — why it was hidden (empty if public),
-                warnings      : [str],
-                errors        : [str]
-            }
-        """
         if config is None:
             config = self.config
 
         title = content_row.get("Title", "untitled")
         print(f"\n🚀 Publisher running for: {title}")
 
-        # ── Step 1: Validate inputs ──────────
-        validation = validate_publisher_inputs(
-            content_row, optimizer_result, config
-        )
+        # Step 1: Validate
+        validation = validate_publisher_inputs(content_row, optimizer_result, config)
         if not validation["valid"]:
             print("🚨 Publisher BLOCKED — validation failed:")
             for err in validation["errors"]:
                 print(f"   ❌ {err}")
             return {
-                "status":         "BLOCKED",
-                "shopify_id":     "",
-                "admin_url":      "",
-                "article_handle": "",
-                "is_hidden":      False,
-                "hidden_reason":  "",
-                "warnings":       validation["warnings"],
-                "errors":         validation["errors"]
+                "status": "BLOCKED", "shopify_id": "", "admin_url": "",
+                "article_handle": "", "is_hidden": False, "hidden_reason": "",
+                "warnings": validation["warnings"], "errors": validation["errors"]
             }
 
         if validation["warnings"]:
             for w in validation["warnings"]:
                 print(f"   ⚠ {w}")
 
-        # ── Step 2: Gather publish data ──────
+        # Step 2: Gather data
         brand           = config.get("brand", {})
         default_section = brand.get("default_section", "")
         section_name    = content_row.get("Section", "") or default_section
@@ -331,10 +345,6 @@ class PublisherAgent:
         summary         = content_row.get("Summary",  "")
         author_name     = brand.get("default_author_name", "Glomend Editorial Team")
 
-        # ✅ FIX: Visibility viene del loop Writer+Reviewer en el orchestrator.
-        # "hidden"  → Writer agotó retries → publicar Live pero como hidden
-        # "" / None → APPROVED              → publicar Live como Public
-        # SIEMPRE isPublished=True — nunca Draft en Shopify
         visibility_raw = str(content_row.get("Visibility", "")).strip().lower()
         is_hidden      = visibility_raw == "hidden"
         hidden_reason  = (
@@ -349,34 +359,27 @@ class PublisherAgent:
         url_slug     = optimizer_result.get("url_slug",         "")
 
         if url_slug:
-            url_slug = re.sub(
-                r'[^a-z0-9-]', '',
-                url_slug.lower().replace(" ", "-")
-            )
+            url_slug = re.sub(r'[^a-z0-9-]', '', url_slug.lower().replace(" ", "-"))
 
-        # ── Step 3: Assemble final HTML with schema ──
+        # Step 3: Assemble HTML
         final_body = self._assemble_body(html_content, schema_block)
 
-        # ── Step 4: Get featured image ───────
+        # Step 4: Get image (Pexels → Unsplash → placeholder)
         image_url, image_alt = self._get_featured_image(keyword)
 
-        # ── Step 5: Find Blog ID ─────────────
+        # Step 5: Find Blog ID
         try:
             blog_id = self._get_blog_id_by_name(section_name)
         except Exception as e:
             print(f"   🚨 Could not find Blog ID: {e}")
             return {
-                "status":         "FAILED",
-                "shopify_id":     "",
-                "admin_url":      "",
-                "article_handle": "",
-                "is_hidden":      False,
-                "hidden_reason":  "",
-                "warnings":       validation["warnings"],
-                "errors":         [f"Blog lookup failed: {str(e)}"]
+                "status": "FAILED", "shopify_id": "", "admin_url": "",
+                "article_handle": "", "is_hidden": False, "hidden_reason": "",
+                "warnings": validation["warnings"],
+                "errors": [f"Blog lookup failed: {str(e)}"]
             }
 
-        # ── Step 6: Build GraphQL mutation ───
+        # Step 6: Build mutation
         mutation = """
         mutation articleCreate($article: ArticleCreateInput!) {
             articleCreate(article: $article) {
@@ -396,20 +399,15 @@ class PublisherAgent:
         metafields = []
         if meta_title:
             metafields.append({
-                "namespace": "global",
-                "key":       "title_tag",
-                "value":     meta_title[:60],
-                "type":      "single_line_text_field"
+                "namespace": "global", "key": "title_tag",
+                "value": meta_title[:60], "type": "single_line_text_field"
             })
         if meta_desc:
             metafields.append({
-                "namespace": "global",
-                "key":       "description_tag",
-                "value":     meta_desc[:155],
-                "type":      "single_line_text_field"
+                "namespace": "global", "key": "description_tag",
+                "value": meta_desc[:155], "type": "single_line_text_field"
             })
 
-        # ✅ FIX: base tags del keyword + "needs-review" si es hidden
         tags = [t.strip() for t in keyword.split(",") if t.strip()][:5]
         if is_hidden:
             tags.append("needs-review")
@@ -420,7 +418,7 @@ class PublisherAgent:
                 "body":        final_body,
                 "blogId":      blog_id,
                 "author":      {"name": author_name},
-                "isPublished": True,          # ✅ SIEMPRE True — nunca Draft
+                "isPublished": True,
                 "summary":     summary[:500] if summary else "",
                 "tags":        tags,
                 **({"handle": url_slug} if url_slug else {}),
@@ -432,7 +430,7 @@ class PublisherAgent:
             }
         }
 
-        # ── Step 7: Publish to Shopify ───────
+        # Step 7: Publish
         live_label = "Live/Hidden (needs-review)" if is_hidden else "Live/Public"
         print(f"   📤 Pushing '{title}' to Shopify as {live_label}...")
         try:
@@ -440,44 +438,31 @@ class PublisherAgent:
         except Exception as e:
             print(f"   🚨 GraphQL publish failed: {e}")
             return {
-                "status":         "FAILED",
-                "shopify_id":     "",
-                "admin_url":      "",
-                "article_handle": "",
-                "is_hidden":      False,
-                "hidden_reason":  "",
-                "warnings":       validation["warnings"],
-                "errors":         [f"GraphQL publish failed: {str(e)}"]
+                "status": "FAILED", "shopify_id": "", "admin_url": "",
+                "article_handle": "", "is_hidden": False, "hidden_reason": "",
+                "warnings": validation["warnings"],
+                "errors": [f"GraphQL publish failed: {str(e)}"]
             }
 
-        # ── Step 8: Handle Shopify response ──
+        # Step 8: Handle response
         user_errors = result.get("articleCreate", {}).get("userErrors", [])
         if user_errors:
             msg = user_errors[0]["message"]
             print(f"   ❌ Shopify userError: {msg}")
             return {
-                "status":         "FAILED",
-                "shopify_id":     "",
-                "admin_url":      "",
-                "article_handle": "",
-                "is_hidden":      False,
-                "hidden_reason":  "",
-                "warnings":       validation["warnings"],
-                "errors":         [f"Shopify userError: {msg}"]
+                "status": "FAILED", "shopify_id": "", "admin_url": "",
+                "article_handle": "", "is_hidden": False, "hidden_reason": "",
+                "warnings": validation["warnings"],
+                "errors": [f"Shopify userError: {msg}"]
             }
 
         article   = result["articleCreate"]["article"]
         raw_id    = article["id"]
         handle    = article.get("handle", "")
         clean_id  = raw_id.split("/")[-1]
-        admin_url = (
-            f"https://{self.shop}.myshopify.com"
-            f"/admin/articles/{clean_id}"
-        )
+        admin_url = f"https://{self.shop}.myshopify.com/admin/articles/{clean_id}"
 
-        # ── Step 9: Update ChromaDB memory ───
-        # Solo para artículos Public — los hidden no deben influir
-        # en la detección de duplicados hasta que sean aprobados
+        # Step 9: ChromaDB
         if self.optimizer_agent and summary and not is_hidden:
             blog_handle    = section_name.lower().replace(" ", "-")
             storefront_url = f"/blogs/{blog_handle}/{handle}"
@@ -492,7 +477,7 @@ class PublisherAgent:
                 "ChromaDB memory NOT updated — Summary was missing."
             )
 
-        # ── Step 10: Build final warnings ────
+        # Step 10: Final warnings
         final_warnings = list(validation["warnings"])
         if optimizer_result.get("status") == "Needs Review":
             final_warnings.append(
@@ -500,17 +485,13 @@ class PublisherAgent:
                 "Check ReviewerNotes in Google Sheet."
             )
 
-        # ── Step 11: Report ──────────────────
+        # Step 11: Report
         print(f"✅ Published: {live_label}")
         print(f"   Admin URL  : {admin_url}")
         print(f"   Handle     : {handle}")
         if is_hidden:
             print(f"   ⚠️  Reason   : {hidden_reason}")
-        for w in final_warnings:
-            print(f"   ⚠ {w}")
 
-        # ✅ FIX: status siempre "Live"
-        # El orchestrator usa is_hidden para Sheet + Telegram
         return {
             "status":         "Live",
             "shopify_id":     raw_id,
@@ -531,15 +512,15 @@ if __name__ == "__main__":
     from dotenv import load_dotenv
     load_dotenv()
 
-    # Test 1: APPROVED → Live/Public
     agent = PublisherAgent()
+
     result = agent.publish_post(
         content_row = {
             "Title":      "Why Does Perimenopause Cause Night Sweats?",
             "Section":    "Sleep",
             "Keyword":    "perimenopause night sweats",
             "Summary":    "Explains how estrogen fluctuations affect the hypothalamus.",
-            "Visibility": ""       # ← vacío = Public
+            "Visibility": ""
         },
         optimizer_result = {
             "status":           "Ready for Approval",
@@ -552,24 +533,3 @@ if __name__ == "__main__":
         }
     )
     print(result)
-
-    # Test 2: Max retries → Live/Hidden
-    result_hidden = agent.publish_post(
-        content_row = {
-            "Title":      "How Cortisol Affects Sleep in Perimenopause",
-            "Section":    "Sleep",
-            "Keyword":    "cortisol sleep perimenopause",
-            "Summary":    "Explains cortisol and sleep disruption.",
-            "Visibility": "hidden"  # ← hidden = necesita revisión
-        },
-        optimizer_result = {
-            "status":           "Ready for Approval",
-            "html":             "<p>Test article body.</p>",
-            "schema":           "",
-            "meta_title":       "Cortisol and Sleep | Glomend",
-            "meta_description": "How cortisol disrupts sleep during perimenopause.",
-            "url_slug":         "cortisol-sleep-perimenopause",
-            "word_count":       900
-        }
-    )
-    print(result_hidden)

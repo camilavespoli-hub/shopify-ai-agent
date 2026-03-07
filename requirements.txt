@@ -13,7 +13,7 @@ google-auth-oauthlib          # OAuth for gspread service account
 # ══════════════════════════════════════════════
 # WEB SEARCH
 # ══════════════════════════════════════════════
-duckduckgo-search             # DuckDuckGo search — from duckduckgo_search import DDGS
+ddgs        # DuckDuckGo search — from duckduckgo_search import DDGS
 pytrends                      # Google Trends — used in Planner
 
 # ══════════════════════════════════════════════

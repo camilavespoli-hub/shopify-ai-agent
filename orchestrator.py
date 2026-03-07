@@ -1,9 +1,11 @@
 import os
+import re
 import json
 import time
 import logging
 import requests
 import gspread
+from datetime import date
 from dotenv import load_dotenv
 
 from database_manager import DatabaseManager
@@ -268,16 +270,29 @@ class ContentOrchestrator:
                 blog_types = {}
                 for row in blog_type_rows:
                     bt  = row.get("blog_type", "").strip().lower()
-                    key = row.get("rule_key",  "").strip()
-                    val = row.get("rule_value", "")
-                    if bt and key:
-                        if isinstance(val, str):
-                            if val.upper() == "TRUE":  val = True
-                            elif val.upper() == "FALSE": val = False
-                        blog_types.setdefault(bt, {})[key] = val
+                    if not bt:
+                        continue
+
+                    def _bool(val):
+                        if isinstance(val, bool): return val
+                        return str(val).strip().upper() == "TRUE"
+
+                    blog_types[bt] = {
+                        "includes_faq":              _bool(row.get("includes_faq",              False)),
+                        "target_product_link":        _bool(row.get("target_product_link",        False)),
+                        "actionable_section_title":   str(row.get("actionable_section_title",    "")),
+                        "actionable_section_desc":    str(row.get("actionable_section_desc",     "")),
+                    }
             except Exception:
                 blog_types = {}
                 print("   ⚠️  Config_BlogTypes tab not found — defaults will be used.")
+
+                        # ── Config_TopicMap ───────────────────────────────────────────────
+            try:
+                topic_map_rows = self.sh.worksheet("Config_TopicMap").get_all_records()
+            except Exception:
+                topic_map_rows = []
+                print("   ⚠️  Config_TopicMap tab not found — blog_type balance disabled.")
 
             self.config = {
                 "brand":       brand_flat,
@@ -289,6 +304,7 @@ class ContentOrchestrator:
                 "products":    product_rows,
                 "cadence":     active_cadence,
                 "blog_types":  blog_types,
+                "topic_map":   topic_map_rows,   
             }
 
             required = [
@@ -327,6 +343,7 @@ class ContentOrchestrator:
             print(f"   Sections  : {len(sections)}")
             print(f"   Products  : {len(product_rows)}")
             print(f"   BlogTypes : {len(blog_types)}")
+            print(f"   TopicMap  : {len(topic_map_rows)} entries")
             print(f"   Rules     : {rule_count} rule(s) loaded")
             print(f"   Gemini    : {'✅' if os.getenv('GOOGLE_API_KEY')    else '❌ MISSING'}")
             print(f"   Shopify   : {'✅' if os.getenv('SHOPIFY_SHOP')       else '❌ MISSING'}")
@@ -392,6 +409,36 @@ class ContentOrchestrator:
                 )
 
         self._send_telegram(message)
+    # ══════════════════════════════════════════════════════════════════════
+        # DAILY SUMMARY
+        # ══════════════════════════════════════════════════════════════════════
+    def _send_daily_summary(self, plan_sheet):
+            """Envía resumen diario por Telegram al terminar el run."""
+            try:
+                rows = plan_sheet.get_all_records()
+                total      = len([r for r in rows if r.get("Title")])
+                published  = len([r for r in rows if r.get("Published_Status") == "published"])
+                pending    = len([r for r in rows if r.get("Status") == "Pending Approval"])
+                needs_rev  = len([r for r in rows if r.get("Status") == "Needs Review"])
+                ready      = len([r for r in rows if r.get("Status") == "Ready to Publish"])
+
+                msg = (
+                    f"📊 *Glomend Blog Agent — Daily Report*\n"
+                    f"📅 {date.today().strftime('%B %d, %Y')}\n\n"
+                    f"✅ Published : {published}\n"
+                    f"🚀 Ready     : {ready}\n"
+                    f"⏳ Peding   : {pending}\n"
+                    f"⚠️  Needs Rev : {needs_rev}\n"
+                    f"📝 Total     : {total}\n"
+                )
+                if needs_rev > 0:
+                    stuck = [r.get("Title","")[:40] for r in rows
+                            if r.get("Status") == "Needs Review"][:3]
+                    msg += f"\n🔴 *Stuck posts:*\n" + "\n".join(f"- {t}..." for t in stuck)
+
+                self._send_telegram(msg)
+            except Exception as e:
+                print(f"   ⚠️  Daily summary failed: {e}")
 
     # ─────────────────────────────────────────────────────────────────────────
     # MAIN PIPELINE
@@ -402,6 +449,20 @@ class ContentOrchestrator:
             return
         if not self.load_configurations():
             return
+        try:
+            plan_sheet_temp = self.sh.worksheet("Content_Plan")
+            all_rows = plan_sheet_temp.get_all_records()
+            for i, row in enumerate(all_rows, start=2):
+                if (row.get("Status") == "Needs Review"
+                        and "word count" in str(row.get("Reviewer_Notes", "")).lower()):
+                    self._update_cells(plan_sheet_temp, i, {
+                        "Status":        "Pending Approval",
+                        "Draft_Content": "",
+                        "Reviewer_Notes": "Auto-requeued: word count issue",
+                    })
+                    print(f"   🔄 Auto-requeued: '{row.get('Title', '')}'")
+        except Exception as e:
+            print(f"   ⚠️  Auto-reset failed: {e}")
 
         system_start = self._get_system_setting("Start_From_Agent", default=1)
         if start_from_agent == 1 and system_start != 1:
@@ -438,13 +499,48 @@ class ContentOrchestrator:
         # ══════════════════════════════════════════════════════════════════════
         # AGENT 1: PLANNER
         # ══════════════════════════════════════════════════════════════════════
+        
         if start_from_agent <= 1:
             print("─" * 60)
             print("🧠 AGENT 1: PLANNER")
             try:
-                existing_records  = plan_sheet.get_all_records()
-                existing_titles   = [r.get("Title", "") for r in existing_records if r.get("Title")]
-                sections_to_plan  = self.config["sections"][:sections_limit]
+                existing_records = plan_sheet.get_all_records()
+                existing_titles  = [r.get("Title", "") for r in existing_records if r.get("Title")]
+
+                # ── NEW: pass existing_records + occupied_dates to config ──────
+                self.config["existing_records"] = existing_records
+                self.config["occupied_dates"]   = [
+                    r.get("ScheduledDate", "") for r in existing_records
+                    if r.get("ScheduledDate")
+                ]
+
+                # ── NEW: pick hungriest section based on TopicMap gaps ─────────
+                from planner import compute_coverage_gap
+
+                def _pick_hungriest_section(all_sections):
+                    coverage_gaps = compute_coverage_gap(
+                        existing_records,
+                        self.config.get("topic_map", []),
+                        self.config
+                    )
+                    section_scores = {}
+                    for g in coverage_gaps:
+                        if g["priority"] != "SATURATED":
+                            s = g["section"]
+                            section_scores[s] = section_scores.get(s, 0) + g["remaining"]
+
+                    if not section_scores:
+                        print("   ℹ️  All sections SATURATED or no TopicMap — using first section.")
+                        return all_sections[:sections_limit]
+
+                    best_name = max(section_scores, key=section_scores.get)
+                    print(f"   🏆 Hungriest section: '{best_name}' "
+                          f"(total remaining: {section_scores[best_name]})")
+                    matched = [s for s in all_sections if s["Name"] == best_name]
+                    return matched if matched else all_sections[:sections_limit]
+
+                sections_to_plan = _pick_hungriest_section(self.config["sections"])
+                # ─────────────────────────────────────────────────────────────
 
                 max_topic_attempts = int(self._get_rule("planner", "max_topic_attempts", default=3) or 3)
                 duplicate_action   = self._get_rule("planner", "duplicate_action", default="skip")
@@ -519,8 +615,10 @@ class ContentOrchestrator:
                         plan_sheet.append_rows(
                             [self._planner_row_to_sheet_list(r) for r in approved_rows]
                         )
-                        self._log("info", "Planner", "batch",
-                                  f"Added {len(approved_rows)} topic(s)")
+                        # ── AUTO-APPROVE: cambia status a "Pending Research" para que
+                        # el Researcher lo tome sin intervención humana ─────────────────
+                        # (el Researcher ya filtra por "Pending Approval" — no hay que cambiar nada más)
+                        self._log("info", "Planner", "batch", f"Added {len(approved_rows)} topic(s) — auto-approved")
                         self.db.log_task("Planner", "batch", "SUCCESS",
                                          f"Added {len(approved_rows)} topic(s).")
                     else:
@@ -618,6 +716,7 @@ class ContentOrchestrator:
         #   - status in ("PASS","PASS_WITH_NOTES")  (was == "APPROVED")
         #   - skip condition: checks Draft_Content exists (was Reviewer_Notes=="APPROVED")
         # ══════════════════════════════════════════════════════════════════════
+        
         if start_from_agent <= 3:
             print("\n" + "─" * 60)
             print("✍️  AGENT 3: WRITER  +  🛡️ AGENT 4: REVIEWER (rewrite loop)")
@@ -626,13 +725,11 @@ class ContentOrchestrator:
 
                 for index, row in enumerate(existing_records, start=2):
                     try:
-                        if row.get("Status") != "Pending Approval":
+                        if row.get("Status") not in ("Pending Approval", "Needs Review"):
                             continue
                         if not row.get("Research_Brief"):
                             continue
-                        # ✅ FIX: skip if already written+reviewed
-                        # (Status stays "Pending Approval" until THIS loop changes it)
-                        if row.get("Draft_Content"):
+                        if row.get("Draft_Content") and row.get("Status") != "Needs Review":
                             continue
 
                         research_result = self._safe_json_parse(
@@ -645,11 +742,22 @@ class ContentOrchestrator:
                         title                     = row.get("Title", "")
                         best_draft                = None
                         best_reviewer_summary     = ""
-                        final_status              = "hidden"  # default: hidden if never PASS
+                        final_status              = "hidden"
                         required_fixes_for_writer = []
+                        word_count_min            = int(
+                            self.config["brand"].get("default_word_count_min", 800)
+                        )
 
+                        # ── Helper: check word count ──────────────────────────
+                        def _word_count_ok(html_text):
+                            text = re.sub(r'<[^>]+>', ' ', html_text or "")
+                            return len(text.split()) >= word_count_min
+
+                        # ══════════════════════════════════════════════════════
+                        # PHASE 1: Write with current topic (max_retries)
+                        # ══════════════════════════════════════════════════════
                         for attempt in range(1, max_retries + 1):
-                            print(f"\n   🔄 Attempt {attempt}/{max_retries}: Writing...")
+                            print(f"\n   🔄 Attempt {attempt}/{max_retries}: Writing '{title}'...")
 
                             write_result = writer.write_draft(
                                 content_row     = row,
@@ -661,94 +769,199 @@ class ContentOrchestrator:
 
                             write_status = write_result.get("status", "")
 
-                            if write_status == "HARD_FAIL":
-                                print(f"   🚨 Writer HARD_FAIL on attempt {attempt} — "
-                                      f"compliance violation cannot be auto-fixed.")
-                                self._log("error", "Writer", title, "HARD_FAIL",
-                                          str(write_result.get("violations")))
-                                self.db.log_task("Writer", title, "HARD_FAIL",
-                                                 str(write_result.get("violations")))
-                                break
-
-                            if write_status == "BLOCKED":
-                                print(f"   🚫 Writer BLOCKED on attempt {attempt}: "
-                                      f"{write_result.get('errors')}")
-                                self._log("error", "Writer", title, "BLOCKED",
-                                          str(write_result.get("errors")))
+                            if write_status in ("HARD_FAIL", "BLOCKED"):
+                                print(f"   🚫 Writer {write_status} on attempt {attempt}.")
+                                self._log("error", "Writer", title, write_status,
+                                          str(write_result.get("errors") or write_result.get("violations")))
                                 break
 
                             draft = write_result.get("html", "")
                             if draft:
                                 best_draft = draft
 
-                            # ── ✅ FIX: reviewer.review_draft() + correct param/result names ──
+                            # ── Word count check ──────────────────────────────
+                            if not _word_count_ok(draft):
+                                wc = len(re.sub(r'<[^>]+>', ' ', draft).split())
+                                print(f"   ⚠️  Word count too low ({wc} words < {word_count_min}) "
+                                      f"— requesting expansion (attempt {attempt}/{max_retries})...")
+                                required_fixes_for_writer = [
+                                    f"EXPAND CONTENT: current draft is only ~{wc} words. "
+                                    f"Must reach at least {word_count_min} words. "
+                                    f"Add more detail, examples, and actionable sections."
+                                ]
+                                continue  # retry with expansion instruction
+
+                            # ── Reviewer ──────────────────────────────────────
                             print(f"   🛡️  Reviewer evaluating attempt {attempt}...")
                             review_result = reviewer.review_draft(
                                 content_row     = row,
-                                draft_text      = draft,           # ✅ FIX: was draft_html
+                                draft_text      = draft,
                                 research_result = research_result,
                                 config          = self.config,
                             )
 
                             review_status    = review_result.get("status",           "")
-                            reviewer_summary = review_result.get("reviewer_summary", "")  # ✅ FIX: was "notes"
+                            reviewer_summary = review_result.get("reviewer_summary", "")
                             required_fixes   = review_result.get("required_fixes",   [])
-                            violations       = review_result.get("violations",        [])  # ✅ FIX: was "red_flags"
+                            violations       = review_result.get("violations",        [])
 
                             print(f"      Reviewer: {review_status}")
 
-                            # ✅ FIX: PASS or PASS_WITH_NOTES = green flag (was == "APPROVED")
                             if review_status in ("PASS", "PASS_WITH_NOTES"):
                                 best_draft            = draft
                                 best_reviewer_summary = reviewer_summary
                                 final_status          = "public"
-                                print(f"   ✅ GREEN FLAG on attempt {attempt} — "
-                                      f"queued for Live/Public.")
+                                print(f"   ✅ GREEN FLAG on attempt {attempt} — queued for Live/Public.")
                                 break
 
-                            # FAIL → prepare feedback for Writer
                             best_reviewer_summary     = reviewer_summary
                             required_fixes_for_writer = list(required_fixes)
-
                             for v in violations:
                                 fix = f"COMPLIANCE VIOLATION: {v}"
                                 if fix not in required_fixes_for_writer:
                                     required_fixes_for_writer.append(fix)
 
-                            print(f"   🔁 {len(required_fixes_for_writer)} issue(s) found "
-                                  f"— rewriting with feedback...")
+                            print(f"   🔁 {len(required_fixes_for_writer)} issue(s) — rewriting...")
 
-                            if attempt == max_retries:
-                                print(f"   ⚠️  Max retries ({max_retries}) reached — "
-                                      f"will publish as Live/Hidden for review.")
+                        # ══════════════════════════════════════════════════════
+                        # PHASE 2: Word count still failing → swap topic
+                        # ══════════════════════════════════════════════════════
+                        if final_status != "public" and best_draft and not _word_count_ok(best_draft):
+                            print(f"\n   🔀 Word count still failing after {max_retries} attempts "
+                                  f"— requesting NEW TOPIC from Planner for section '{row.get('Section')}'...")
 
-                        # ── Post-loop ─────────────────────────────────────────
+                            self._log("warning", "Writer", title, "TOPIC_SWAP",
+                                      f"Word count < {word_count_min} after {max_retries} retries.")
+
+                            try:
+                                existing_records_fresh = plan_sheet.get_all_records()
+                                existing_titles_fresh  = [
+                                    r.get("Title", "") for r in existing_records_fresh
+                                    if r.get("Title")
+                                ]
+                                self.config["existing_records"] = existing_records_fresh
+
+                                retry_plan = planner.plan_next_posts(
+                                    sections_config   = [s for s in self.config["sections"]
+                                                         if s["Name"] == row.get("Section")],
+                                    existing_titles   = existing_titles_fresh,
+                                    config            = self.config,
+                                    posts_per_section = 1,
+                                )
+
+                                new_topic_rows = retry_plan.get("new_rows", [])
+
+                                if new_topic_rows:
+                                    new_topic    = new_topic_rows[0]
+                                    new_row      = dict(row)  # copy original row
+                                    new_row.update({
+                                        "Title":             new_topic.get("Title",             title),
+                                        "Keyword":           new_topic.get("Keyword",           row.get("Keyword",  "")),
+                                        "SecondaryKeywords": new_topic.get("SecondaryKeywords", ""),
+                                        "Summary":           new_topic.get("Summary",           ""),
+                                        "BlogType":          new_topic.get("BlogType",          row.get("BlogType", "")),
+                                        "TopicCluster":      new_topic.get("TopicCluster",      ""),
+                                    })
+                                    new_title = new_row["Title"]
+                                    print(f"   🆕 New topic: '{new_title}' — retrying Writer...")
+
+                                    # Re-research the new topic
+                                    new_research = researcher.research_topic(
+                                        content_row    = new_row,
+                                        valid_sections = valid_sections,
+                                        source_policy  = source_policy,
+                                    )
+                                    if new_research.get("status") != "BLOCKED":
+                                        new_research_json = json.dumps(new_research)
+
+                                        # 3 fresh attempts with new topic
+                                        best_draft_swap            = None
+                                        required_fixes_for_writer  = []
+
+                                        for swap_attempt in range(1, max_retries + 1):
+                                            print(f"   🔄 Swap attempt {swap_attempt}/{max_retries}: "
+                                                  f"Writing '{new_title}'...")
+
+                                            swap_write = writer.write_draft(
+                                                content_row     = new_row,
+                                                research_result = new_research,
+                                                config          = self.config,
+                                                previous_draft  = best_draft_swap or "",
+                                                required_fixes  = required_fixes_for_writer,
+                                            )
+
+                                            swap_draft = swap_write.get("html", "")
+                                            if swap_draft:
+                                                best_draft_swap = swap_draft
+
+                                            if not _word_count_ok(swap_draft):
+                                                wc = len(re.sub(r'<[^>]+>', ' ', swap_draft).split())
+                                                required_fixes_for_writer = [
+                                                    f"EXPAND CONTENT: only ~{wc} words. "
+                                                    f"Must reach {word_count_min}+."
+                                                ]
+                                                continue
+
+                                            # Reviewer on swap draft
+                                            swap_review = reviewer.review_draft(
+                                                content_row     = new_row,
+                                                draft_text      = swap_draft,
+                                                research_result = new_research,
+                                                config          = self.config,
+                                            )
+
+                                            if swap_review.get("status") in ("PASS", "PASS_WITH_NOTES"):
+                                                best_draft            = swap_draft
+                                                best_reviewer_summary = swap_review.get("reviewer_summary", "")
+                                                final_status          = "public"
+                                                title                 = new_title
+                                                row                   = new_row
+                                                research_result       = new_research
+                                                print(f"   ✅ New topic passed on swap attempt {swap_attempt}.")
+                                                break
+
+                                            required_fixes_for_writer = swap_review.get("required_fixes", [])
+                                            best_reviewer_summary     = swap_review.get("reviewer_summary", "")
+
+                                        if final_status != "public" and best_draft_swap:
+                                            # Use best swap draft even if not perfect
+                                            best_draft            = best_draft_swap
+                                            best_reviewer_summary = (best_reviewer_summary or
+                                                                      "Topic swapped — word count or review issues remain.")
+                                            title = new_title
+                                            row   = new_row
+                                            print(f"   ⚠️  Swap topic also struggled — publishing best draft as hidden.")
+
+                            except Exception as swap_e:
+                                print(f"   ⚠️  Topic swap failed: {swap_e} — using best draft from original topic.")
+                                self._log("warning", "Writer", title, "TOPIC_SWAP_FAILED", str(swap_e))
+
+                        # ══════════════════════════════════════════════════════
+                        # POST-LOOP: save whatever we have — never stop pipeline
+                        # ══════════════════════════════════════════════════════
                         if not best_draft:
                             self._update_cells(plan_sheet, index, {
                                 "Status":         "Needs Review",
-                                "Reviewer_Notes": (
-                                    "All attempts failed (HARD_FAIL/BLOCKED) — "
-                                    "manual intervention needed."
-                                ),
+                                "Reviewer_Notes": "All attempts failed (HARD_FAIL/BLOCKED) — manual intervention needed.",
                             })
                             self._log("error", "Writer", title, "NO_DRAFT_PRODUCED")
                             self.db.log_task("Writer", title, "NO_DRAFT_PRODUCED",
                                              "No valid draft after all retries.")
-                            continue
+                            continue  # ← skip to next row, don't stop
 
                         self._update_cells(plan_sheet, index, {
                             "Draft_Content":  best_draft,
-                            "WordCount":      str(len(best_draft.split())),
+                            "WordCount":      str(len(re.sub(r'<[^>]+>', ' ', best_draft).split())),
                             "Reviewer_Notes": best_reviewer_summary,
                             "Status":         "Ready_To_Publish",
-                            # ✅ Publisher reads Visibility from content_row
                             "Visibility":     "hidden" if final_status == "hidden" else "",
+                            "Title":          row.get("Title", title),  # update if topic was swapped
                         })
 
                         status_label = (
                             "APPROVED → queued for Live/Public"
                             if final_status == "public"
-                            else f"Max retries ({max_retries}) → queued for Live/Hidden"
+                            else f"Max retries → queued as Live/Hidden (word count or review issues)"
                         )
                         self._log("info", "Writer+Reviewer", title, status_label)
                         self.db.log_task(
@@ -774,7 +987,7 @@ class ContentOrchestrator:
                             })
                         except Exception:
                             pass
-                        continue
+                        continue  # ← siempre continúa
 
             except Exception as e:
                 self._log("error", "Writer", "N/A", "EXCEPTION", str(e))
@@ -803,11 +1016,13 @@ class ContentOrchestrator:
                 for index, row in enumerate(existing_records, start=2):
                     try:
                         # ✅ FIX: "Ready_To_Publish" is what Agent 3+4 writes
-                        if row.get("Status") != "Ready_To_Publish":
+                        OPTIMIZER_ELIGIBLE = ("Ready_To_Publish", "Needs Review")
+                        if row.get("Status") not in OPTIMIZER_ELIGIBLE:
                             continue
                         if not row.get("Draft_Content"):
                             continue
-                        if row.get("Optimized_Draft"):
+                        # Re-evalúa "Needs Review" aunque ya tenga Optimized_Draft
+                        if row.get("Optimized_Draft") and row.get("Status") != "Needs Review":
                             continue
 
                         title = row.get("Title", "")
@@ -901,6 +1116,8 @@ class ContentOrchestrator:
             telegram_on_hidden = self._get_rule(
                 "publisher", "telegram_on_hidden", default=True
             )
+            published_today = 0
+            max_per_run = int(self._get_rule("publisher", "max_per_run", default=1) or 1)
 
             try:
                 existing_records = plan_sheet.get_all_records()
@@ -913,6 +1130,18 @@ class ContentOrchestrator:
                             continue
                         if row.get("Published_Status"):
                             continue
+
+                        # ── NEW: only publish if ScheduledDate is today or past ──
+                        from datetime import date
+                        today_str      = date.today().strftime("%Y-%m-%d")
+                        scheduled_date = str(row.get("ScheduledDate", "")).strip()
+                        if scheduled_date and scheduled_date > today_str:
+                            print(f"   ⏳ '{row.get('Title', '')}' scheduled for "
+                                  f"{scheduled_date} — skipping today.")
+                            continue
+                        if published_today >= max_per_run:
+                            print(f"   ⏸️  Max {max_per_run} post(s) per run reached — stopping.")
+                            break
 
                         title = row.get("Title", "")
 
@@ -968,6 +1197,8 @@ class ContentOrchestrator:
                             # ✅ FIX: Sheet labels use is_hidden from Publisher result
                             sheet_status     = "Live (Hidden)" if is_hidden else "Live"
                             published_label  = "Hidden - Needs Review" if is_hidden else "Live"
+
+                            published_today += 1
 
                             self._update_cells(plan_sheet, index, {
                                 "Status":           sheet_status,
@@ -1034,9 +1265,11 @@ class ContentOrchestrator:
         # ══════════════════════════════════════════════════════════════════════
         # PIPELINE COMPLETE
         # ══════════════════════════════════════════════════════════════════════
+        self._send_daily_summary(plan_sheet)
         print("\n✅ Pipeline run complete.")
         logging.info("Pipeline run complete.")
 
+        
 
 # ── Entry point ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":

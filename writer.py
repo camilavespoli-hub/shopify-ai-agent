@@ -156,7 +156,7 @@ def check_compliance(html, config=None):
         r"\b(heals?|healed|healing)\s+(insomnia|depression|anxiety|diabetes|cancer|dementia|disease|disorder|condition)\b",
         r"\b(reverses?|reversed|reversing)\s+(insomnia|depression|anxiety|diabetes|cancer|dementia|disease|disorder|condition)\b",
         r"\b(prevents?|prevented|preventing)\s+(disease|cancer|diabetes|depression|disorder|dementia)\b",
-        r"\b(diagnoses|diagnosed|diagnosing)\b",
+        r"\b(diagnoses|diagnosed|diagnosing)\b.{0,30}\b(our product|Glomend|supplement)\b",
         r"\b(eliminates?|eliminated)\b.{0,30}\b(disease|condition|disorder)\b",
         r"works like a prescription",
         r"clinically proven to (treat|cure|prevent)",

@@ -5,6 +5,7 @@ import json
 from google import genai
 from datetime import datetime, timedelta, date
 
+
 try:
     from pytrends.request import TrendReq
     PYTRENDS_AVAILABLE = True
@@ -13,9 +14,11 @@ except ImportError:
     print("⚠️  pytrends not installed — keyword trend scoring will be skipped.")
 
 
+
 # ══════════════════════════════════════════════════════════════════════════════
 # INPUT VALIDATOR
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 def validate_planner_inputs(sections_config, existing_titles, config):
     errors   = []
@@ -55,12 +58,26 @@ def validate_planner_inputs(sections_config, existing_titles, config):
     if not config.get("planner", {}).get("trend_score_threshold"):
         warnings.append("trend_score_threshold missing from Config_Planner — defaulting to 10.")
 
+    # ── NEW: warn if topic_map or existing_records missing ───────────────────
+    if not config.get("topic_map"):
+        warnings.append(
+            "topic_map not found in config — blog_type balance disabled. "
+            "Add Config_TopicMap tab and pass it via orchestrator."
+        )
+    if not config.get("existing_records"):
+        warnings.append(
+            "existing_records not found in config — coverage gap will default to zero. "
+            "Pass plan_sheet.get_all_records() via orchestrator."
+        )
+
     return {"valid": len(errors) == 0, "errors": errors, "warnings": warnings}
+
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TOPIC VALIDATOR
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 def validate_topic(idea, existing_titles_lower):
     title   = idea.get("Title",   "").strip()
@@ -99,9 +116,11 @@ def validate_topic(idea, existing_titles_lower):
     return {"valid": True, "reason": ""}
 
 
+
 # ══════════════════════════════════════════════════════════════════════════════
 # SCHEDULING HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 DAY_NAME_TO_NUMBER = {
     "monday": 0, "tuesday": 1, "wednesday": 2,
@@ -121,30 +140,54 @@ def parse_publish_days(cadence_config):
     return sorted(day_numbers) if day_numbers else [0, 2, 4]
 
 
-def compute_scheduled_date(base_date, post_index, cadence_config):
+def compute_scheduled_date(base_date, post_index, cadence_config, occupied_dates=None):
+    """
+    Asigna el próximo día disponible según publish_days,
+    evitando fechas ya ocupadas por otros posts.
+    """
     publish_days = parse_publish_days(cadence_config)
     raw_blackout = cadence_config.get("blackout_dates", "")
     blackout_set = set(d.strip() for d in raw_blackout.split(",") if d.strip())
+    occupied_set = set(occupied_dates or [])
+    days_between = int(cadence_config.get("days_between_posts", 1))
 
-    slot        = post_index % len(publish_days)
-    week_offset = post_index // len(publish_days)
-    target_wday = publish_days[slot]
+    # Genera candidatos de fechas hacia adelante
+    candidate = base_date
+    slots_found = 0
+    max_days = 365  # safety limit
 
-    start    = base_date + timedelta(weeks=week_offset)
-    days_fwd = (target_wday - start.weekday()) % 7
-    target   = start + timedelta(days=days_fwd)
+    for _ in range(max_days):
+        if (candidate.weekday() in publish_days
+                and candidate.strftime("%Y-%m-%d") not in blackout_set
+                and candidate.strftime("%Y-%m-%d") not in occupied_set):
 
-    while target.strftime("%Y-%m-%d") in blackout_set:
-        target += timedelta(days=1)
+            if slots_found == post_index:
+                return candidate.strftime("%Y-%m-%d")
+            slots_found += 1
+            occupied_set.add(candidate.strftime("%Y-%m-%d"))  # marca como ocupado
 
-    return target.strftime("%Y-%m-%d")
+            for gap in range(1, days_between):
+                blocked = candidate + timedelta(days=gap)
+                occupied_set.add(blocked.strftime("%Y-%m-%d"))
+
+        candidate += timedelta(days=1)
+
+    return base_date.strftime("%Y-%m-%d")  # fallback
+
+
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # COVERAGE HELPER
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 def compute_coverage_gap(existing_records, topic_map, config):
+    # ── NEW: early return with warning if no topic_map ────────────────────────
+    if not topic_map:
+        print("   ⚠️  TopicMap is empty — blog_type balance disabled, defaulting to 'educational'.")
+        return []
+
     system      = config.get("system", {})
     reset_every = int(system.get("reset_every_n_posts", 20))
 
@@ -176,7 +219,7 @@ def compute_coverage_gap(existing_records, topic_map, config):
     for entry in topic_map:
         section   = entry.get("section",   "").strip()
         blog_type = entry.get("blog_type", "").strip()
-        weight     = float(entry.get("monthly_weight", 0)) / 100
+        weight    = float(entry.get("monthly_weight", 0)) / 100
         cycle_goal = max(1, round(weight * reset_every))
 
         key       = (section, blog_type)
@@ -199,12 +242,21 @@ def compute_coverage_gap(existing_records, topic_map, config):
             "priority":  priority,
         })
 
+    # ── NEW: print coverage table for visibility ──────────────────────────────
+    print("   📊 Coverage gaps (current cycle):")
+    for g in sorted(gaps, key=lambda x: (x["section"], -x["remaining"])):
+        icon = "⚠️ " if g["priority"] == "HIGH" else ("✅" if g["priority"] == "SATURATED" else "→ ")
+        print(f"      {icon} [{g['section']:25s}] {g['blog_type']:20s} "
+              f"{g['current']}/{g['goal']} — {g['priority']}")
+
     return gaps
+
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PLANNER AGENT
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 class PlannerAgent:
 
@@ -304,23 +356,21 @@ class PlannerAgent:
 
         brand = config.get("brand", {})
 
-        # FIX 3: Cast defensivo — cualquier valor no-string del Sheet
-        # causaría un list_value en el proto3 del SDK de Gemini
-        brand_name     = str(brand.get("brand_name",              "the brand"))
-        age_range      = str(brand.get("audience_age_range",      "38–55"))
-        gender         = str(brand.get("audience_gender",         "female"))
-        pain_points    = str(brand.get("audience_pain_points",    "fatigue, brain fog, weight gain"))
-        sophistication = str(brand.get("audience_sophistication", "educated, reads labels"))
-        tone           = str(brand.get("tone_formality",          "conversational"))
-        competitors    = str(brand.get("competitor_names",        ""))
-        products       = str(brand.get("product_names",           ""))
-        avoid_topics   = str(brand.get("avoid_topics",            "competitor names, political topics"))
-        language       = str(brand.get("content_language",        "en"))
-        industry       = str(brand.get("industry",                "supplements"))
-        compliance     = str(brand.get("compliance_framework",    "FDA"))
-        disclaimer     = str(brand.get("disclaimer_text",         ""))
-        section_name   = str(section_name)
-        section_desc   = str(section_desc)
+        brand_name       = str(brand.get("brand_name",              "the brand"))
+        age_range        = str(brand.get("audience_age_range",      "38–55"))
+        gender           = str(brand.get("audience_gender",         "female"))
+        pain_points      = str(brand.get("audience_pain_points",    "fatigue, brain fog, weight gain"))
+        sophistication   = str(brand.get("audience_sophistication", "educated, reads labels"))
+        tone             = str(brand.get("tone_formality",          "conversational"))
+        competitors      = str(brand.get("competitor_names",        ""))
+        products         = str(brand.get("product_names",           ""))
+        avoid_topics     = str(brand.get("avoid_topics",            "competitor names, political topics"))
+        language         = str(brand.get("content_language",        "en"))
+        industry         = str(brand.get("industry",                "supplements"))
+        compliance       = str(brand.get("compliance_framework",    "FDA"))
+        disclaimer       = str(brand.get("disclaimer_text",         ""))
+        section_name     = str(section_name)
+        section_desc     = str(section_desc)
         coverage_context = str(coverage_context)
 
         language_names = {
@@ -364,6 +414,7 @@ class PlannerAgent:
 
         return f"""You are a senior SEO and content strategist for {brand_name}.
 
+
 ════════════════════════════════════════
 LANGUAGE
 ════════════════════════════════════════
@@ -371,11 +422,13 @@ Write ALL output exclusively in {language_label}.
 Titles, keywords, and summaries must all be in {language_label}.
 
 
+
 ════════════════════════════════════════
 BRAND CONTEXT
 ════════════════════════════════════════
 Products           : {products}
 Section            : {section_name} — {section_desc}
+
 
 
 ════════════════════════════════════════
@@ -388,10 +441,12 @@ Sophistication     : {sophistication}
 Tone               : {tone}
 
 
+
 ════════════════════════════════════════
 COMPLIANCE RULES ({compliance})
 ════════════════════════════════════════
 {compliance_rules}
+
 
 
 ════════════════════════════════════════
@@ -400,11 +455,13 @@ CONTENT QUOTA STATUS (current cycle)
 {coverage_context if coverage_context else "No coverage data available — generate freely."}
 
 
+
 ════════════════════════════════════════
 TASK
 ════════════════════════════════════════
 Generate exactly {amount} original blog post idea(s).
 Blog type for this batch: {target_blog_type.upper()}
+
 
 Blog type behavior:
 - educational    → Explains a symptom, mechanism, or concept. Informational intent.
@@ -413,7 +470,9 @@ Blog type behavior:
 - customer story → Real-feeling narrative of a woman's transformation. First-person tone.
 - case study     → Data or outcome-driven. Focuses on results and mechanisms.
 
+
 {blog_type_instruction}
+
 
 TITLE RULES:
 - Phrase as a question this specific audience would Google.
@@ -423,16 +482,20 @@ TITLE RULES:
 - Must reference a specific symptom, mechanism, or outcome — not a generic topic.
 - Must NOT resemble any title in the existing list below.
 
+
 KEYWORD RULES:
 - Primary: one long-tail keyword (3–5 words) with clear informational search intent.
 - Secondary: two related supporting keywords.
+
 
 SUMMARY RULES:
 - One sentence: what the article explains and who it helps.
 - Must mention a specific biological mechanism, hormone, or symptom.
 
+
 FAQ INSTRUCTION:
 {faq_instruction}
+
 
 STRICT EXCLUSIONS:
 - No disease claims.
@@ -441,10 +504,12 @@ STRICT EXCLUSIONS:
 - No generic wellness content with no {section_name.lower()} angle.
 
 
+
 ════════════════════════════════════════
 EXISTING TITLES — Do NOT repeat or closely resemble:
 ════════════════════════════════════════
 {titles_block}
+
 
 
 ════════════════════════════════════════
@@ -452,6 +517,7 @@ OUTPUT FORMAT
 ════════════════════════════════════════
 Output ONLY a valid JSON array inside a ```json block.
 No text outside the block. No numbering. No pipe characters.
+
 
 ```json
 [
@@ -497,6 +563,7 @@ No text outside the block. No numbering. No pipe characters.
         topic_map        = cfg.get("topic_map",        [])
         existing_records = cfg.get("existing_records", [])
         coverage_gaps    = compute_coverage_gap(existing_records, topic_map, cfg)
+        occupied_dates_runtime = list(cfg.get("occupied_dates", []))
 
         def _coverage_summary(section_name):
             section_gaps = [g for g in coverage_gaps if g["section"] == section_name]
@@ -521,8 +588,15 @@ No text outside the block. No numbering. No pipe characters.
                 if g["section"] == section_name and g["priority"] != "SATURATED"
             ]
             if not section_gaps:
+                # ── NEW: log when falling back to educational ─────────────────
+                print(f"   ℹ️  [{section_name}] All blog types SATURATED or no TopicMap "
+                      f"— defaulting to 'educational'.")
                 return "educational"
-            return max(section_gaps, key=lambda x: x["remaining"])["blog_type"]
+            top    = max(section_gaps, key=lambda x: x["remaining"])
+            chosen = top["blog_type"]
+            print(f"   🎯 [{section_name}] Selected blog_type: '{chosen}' "
+                  f"(remaining: {top['remaining']}, priority: {top['priority']})")
+            return chosen
 
         # ── Step 3: Loop through sections ─────────────────────────────────────
         for section in sections_config:
@@ -544,9 +618,6 @@ No text outside the block. No numbering. No pipe characters.
             )
 
             # ── Step 4: Call Gemini ───────────────────────────────────────────
-            # FIX 2: contents como estructura explícita de Content/Part.
-            # Previene que el SDK interprete el string largo como lista
-            # o conversación multi-turn → elimina el APIError .
             try:
                 response = self.client.models.generate_content(
                     model    = self.model_name,
@@ -599,22 +670,25 @@ No text outside the block. No numbering. No pipe characters.
                 # ── Step 8: Schedule date ─────────────────────────────────────
                 scheduled_date = compute_scheduled_date(
                     base_date      = today,
-                    post_index     = len(existing_titles) + len(new_rows),
-                    cadence_config = cadence_config
+                    post_index     = 0,  # siempre 0, runtime_list excluye los usados
+                    cadence_config = cadence_config,
+                    occupied_dates = occupied_dates_runtime
                 )
+                
+                occupied_dates_runtime.append(scheduled_date)
                 scheduled_time = cadence_config.get("publish_time", "09:00 AM ET")
 
                 # ── Step 9: Build row dict ────────────────────────────────────
-                # FIX 1: SecondaryKeywords — Gemini a veces devuelve una lista
-                # ["kw1", "kw2"] en lugar de un string. Si es lista, la unimos.
-                # Si ya es string, la usamos directo. Nunca enviamos una lista
-                # al Sheet ni al siguiente prompt de Gemini.
                 raw_secondary = idea.get("SecondaryKeywords", "")
                 secondary_keywords = (
                     ", ".join(raw_secondary)
                     if isinstance(raw_secondary, list)
                     else str(raw_secondary)
                 )
+
+                # ── NEW: enforce blog_type from picker, not Gemini's suggestion
+                # Gemini may hallucinate a different blog_type — we override it
+                final_blog_type = target_blog_type
 
                 new_rows.append({
                     "Status":            "Pending Approval",
@@ -626,7 +700,7 @@ No text outside the block. No numbering. No pipe characters.
                     "ScheduledDate":     scheduled_date,
                     "ScheduledTime":     scheduled_time,
                     "ReviewerNotes":     trend_note,
-                    "BlogType":          str(idea.get("BlogType",     target_blog_type)),
+                    "BlogType":          final_blog_type,   # ← always from picker
                     "TopicCluster":      str(idea.get("TopicCluster", "")),
                 })
 
