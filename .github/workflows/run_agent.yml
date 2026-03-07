@@ -1,9 +1,10 @@
+cat > .github/workflows/run_agent.yml << 'EOF'
 name: Shopify AI Agent - Daily Run
 
 on:
   schedule:
-    - cron: '0 14 * * *'   # 9:00 AM EST todos los días
-  workflow_dispatch:         # Permite correrlo manualmente desde GitHub
+    - cron: '0 14 * * *'
+  workflow_dispatch:
 
 jobs:
   run-agent:
@@ -27,10 +28,14 @@ jobs:
 
       - name: Run orchestrator
         env:
-          GEMINI_API_KEY:         ${{ secrets.GEMINI_API_KEY }}
-          SHOPIFY_STORE_URL:      ${{ secrets.SHOPIFY_STORE_URL }}
-          SHOPIFY_ACCESS_TOKEN:   ${{ secrets.SHOPIFY_ACCESS_TOKEN }}
-          TELEGRAM_BOT_TOKEN:     ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID:       ${{ secrets.TELEGRAM_CHAT_ID }}
-          PEXELS_API_KEY:         ${{ secrets.PEXELS_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          SHOPIFY_SHOP: ${{ secrets.SHOPIFY_SHOP }}
+          SHOPIFY_CLIENT_ID: ${{ secrets.SHOPIFY_CLIENT_ID }}
+          SHOPIFY_CLIENT_SECRET: ${{ secrets.SHOPIFY_CLIENT_SECRET }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
+          UNSPLASH_ACCESS_KEY: ${{ secrets.UNSPLASH_ACCESS_KEY }}
+          SHEET_NAME: ${{ secrets.SHEET_NAME }}
         run: python3 orchestrator.py
+EOF
