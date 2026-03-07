@@ -1,5 +1,4 @@
-cat > .github/workflows/run_agent.yml << 'EOF'
-name: Shopify AI Agent - Daily Run
+name: ShopifyAIAgent
 
 on:
   schedule:
@@ -10,22 +9,17 @@ jobs:
   run-agent:
     runs-on: ubuntu-latest
     timeout-minutes: 30
-
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
       - name: Install dependencies
         run: pip install -r requirements.txt
-
       - name: Write Google credentials
         run: echo '${{ secrets.GOOGLE_CREDENTIALS_JSON }}' > service_account.json
-
       - name: Run orchestrator
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
@@ -38,4 +32,3 @@ jobs:
           UNSPLASH_ACCESS_KEY: ${{ secrets.UNSPLASH_ACCESS_KEY }}
           SHEET_NAME: ${{ secrets.SHEET_NAME }}
         run: python3 orchestrator.py
-EOF
