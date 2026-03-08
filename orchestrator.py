@@ -345,7 +345,7 @@ class ContentOrchestrator:
             print(f"   BlogTypes : {len(blog_types)}")
             print(f"   TopicMap  : {len(topic_map_rows)} entries")
             print(f"   Rules     : {rule_count} rule(s) loaded")
-            print(f"   Gemini    : {'✅' if os.getenv('GOOGLE_API_KEY')    else '❌ MISSING'}")
+            print(f"   Gemini    : {'✅' if os.getenv('GEMINI_API_KEY')    else '❌ MISSING'}")
             print(f"   Shopify   : {'✅' if os.getenv('SHOPIFY_SHOP')       else '❌ MISSING'}")
             print(f"   Pexels    : {'✅' if os.getenv('PEXELS_API_KEY')     else '⚠️ missing'}")
             print(f"   Telegram  : {'✅' if os.getenv('TELEGRAM_BOT_TOKEN') else '⚠️ missing'}")
