@@ -627,9 +627,9 @@ class ReviewerAgent:
 
         # ── Gemini client ─────────────────────────────────────────────────────
         # Model priority: Config_System tab → GEMINI_MODEL env var → default
-        api_key = os.getenv("GOOGLE_API_KEY")
+        api_key = os.getenv("GEMINI_API_KEY")
         if not api_key:
-            print("   ❌ GOOGLE_API_KEY missing — Reviewer will fail.")
+            print("   ❌ GEMINI_API_KEY missing — Reviewer will fail.")
 
         self.client = genai.Client(api_key=api_key)
 

@@ -560,7 +560,7 @@ class OptimizerAgent:
         self.config = config or {"brand": {}, "system": {}}
 
         # ── Gemini client ──────────────────────────────────────────────────
-        api_key = os.getenv("GOOGLE_API_KEY")
+        api_key = os.getenv("GEMINI_API_KEY")
         self.client = genai.Client(api_key=api_key)
 
         # Model priority: Config_System sheet → env var → hardcoded default

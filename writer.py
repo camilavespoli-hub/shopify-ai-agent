@@ -247,9 +247,9 @@ class WriterAgent:
         print("✍️  Initializing Writer Agent...")
         self.config = config or {"brand": {}, "system": {}, "agent_rules": {}}
 
-        api_key = os.getenv("GOOGLE_API_KEY")
+        api_key = os.getenv("GEMINI_API_KEY")
         if not api_key:
-            print("   ❌ GOOGLE_API_KEY missing — Writer will fail.")
+            print("   ❌ GEMINI_API_KEY missing — Writer will fail.")
 
         self.client = genai.Client(api_key=api_key)
 
