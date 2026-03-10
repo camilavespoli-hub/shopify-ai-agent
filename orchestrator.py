@@ -1004,7 +1004,8 @@ class ContentOrchestrator:
 
             non_blocking_raw      = self._get_rule(
                 "orchestrator", "non_blocking_warnings",
-                default="Internal link inventory unavailable,schema_type missing"
+                default="Internal link inventory unavailable,schema_type missing, \
+                        No inline images,Featured image is attached,Word count"
             )
             non_blocking_warnings = [
                 w.strip() for w in str(non_blocking_raw).split(",") if w.strip()
