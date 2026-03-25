@@ -3,8 +3,12 @@ import re
 import json
 import requests
 from google import genai
-import chromadb
-from chromadb.utils import embedding_functions
+try:
+    import chromadb
+    from chromadb.utils import embedding_functions
+    CHROMADB_AVAILABLE = True
+except ImportError:
+    CHROMADB_AVAILABLE = False
 from datetime import date
 
 
@@ -580,14 +584,19 @@ class OptimizerAgent:
         # ── ChromaDB vector store ──────────────────────────────────────────
         # Stores published article summaries for related-reading suggestions.
         # Uses sentence-transformers (local model — no API call needed).
-        self.chroma_client = chromadb.PersistentClient(path="./chroma_db")
-        self.embed_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
-            model_name="all-MiniLM-L6-v2"
-        )
-        self.collection = self.chroma_client.get_or_create_collection(
-            name="blog_history",
-            embedding_function=self.embed_fn
-        )
+        if CHROMADB_AVAILABLE:
+            self.chroma_client = chromadb.PersistentClient(path="./chroma_db")
+            self.embed_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
+                model_name="all-MiniLM-L6-v2"
+            )
+            self.collection = self.chroma_client.get_or_create_collection(
+                name="blog_history",
+                embedding_function=self.embed_fn
+            )
+        else:
+            self.chroma_client = None
+            self.collection = None
+            print("⚠️  chromadb not installed — related-reading suggestions disabled.")
 
         # ── Non-blocking warning keywords ──────────────────────────────────
         # Warnings that contain any of these strings will NOT change the
@@ -673,6 +682,8 @@ class OptimizerAgent:
         This result is injected into the prompt so Gemini can add a
         <div class="related-reading"> section at the end of the article.
         """
+        if not self.collection:
+            return ""
         try:
             results = self.collection.query(
                 query_texts=[current_summary],
@@ -703,6 +714,8 @@ class OptimizerAgent:
             summary : plain text summary (used as embedding vector)
             url     : Shopify storefront URL (e.g., /blogs/sleep/article-handle)
         """
+        if not self.collection:
+            return
         try:
             self.collection.add(
                 documents=[summary],
