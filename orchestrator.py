@@ -1274,5 +1274,6 @@ class ContentOrchestrator:
 
 # ── Entry point ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    bot = ContentOrchestrator(sheet_name="Blog_agent_ai")
+    sheet_name = os.getenv("SHEET_NAME", "Blog_agent_ai")
+    bot = ContentOrchestrator(sheet_name=sheet_name)
     bot.run(start_from_agent=1)

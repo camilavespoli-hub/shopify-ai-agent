@@ -20,7 +20,7 @@ jobs:
         with:
           python-version: '3.11'
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: pip install -r requirements-ci.txt
       - name: Write Google credentials
         run: echo '${{ secrets.GOOGLE_CREDENTIALS_JSON }}' > service_account.json
       - name: Run orchestrator

@@ -1,0 +1,15 @@
+# Core pipeline dependencies (CI/GitHub Actions)
+# Loose pins for cross-platform compatibility (Linux runners)
+google-genai>=1.0
+gspread>=6.0
+python-dotenv>=1.0
+requests>=2.31
+beautifulsoup4>=4.12
+lxml>=5.0
+ddgs>=6.0
+ShopifyAPI>=12.0
+Pillow>=10.0
+google-auth>=2.0
+google-api-python-client>=2.0
+google-auth-oauthlib>=1.0
+oauth2client>=4.0
