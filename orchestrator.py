@@ -1028,7 +1028,91 @@ class ContentOrchestrator:
                         if row.get("Optimized_Draft") and row.get("Status") != "Needs Review":
                             continue
 
-                        title = row.get("Title", "")
+                        title      = row.get("Title", "")
+                        draft_text = row.get("Draft_Content", "")
+
+                        # ── Pre-Optimizer word count gate ──────────────────────
+                        # If the draft is already below the minimum, route it back
+                        # to Writer (or Researcher + Writer) before spending an
+                        # Optimizer API call on content that will fail anyway.
+                        word_count_min = int(
+                            self.config["brand"].get("default_word_count_min", 800)
+                        )
+                        wc = len(re.sub(r'<[^>]+>', ' ', draft_text).split())
+
+                        if wc < word_count_min:
+                            reviewer_notes = row.get("Reviewer_Notes", "").lower()
+                            needs_research = any(k in reviewer_notes for k in (
+                                "research", "information", "source", "thin",
+                                "insufficient", "missing", "evidence", "data",
+                            ))
+                            route = "Researcher + Writer" if needs_research else "Writer"
+                            print(f"   ⚠️  Draft has {wc} words (min {word_count_min}) "
+                                  f"— routing to {route} before Optimizer.")
+
+                            _writer   = WriterAgent(config=self.config)
+                            _reviewer = ReviewerAgent(config=self.config)
+                            _src_pol  = self.config["brand"].get("Source_Policy", "")
+                            _sections = [s["Name"] for s in self.config.get("sections", [])]
+
+                            _research = None
+                            if needs_research:
+                                _researcher = ResearcherAgent(config=self.config)
+                                _research   = _researcher.research_topic(
+                                    content_row    = row,
+                                    valid_sections = _sections,
+                                    source_policy  = _src_pol,
+                                )
+                                if _research.get("status") == "BLOCKED":
+                                    print("   ⚠️  Researcher blocked — Writer-only expansion.")
+                                    _research = None
+
+                            expansion_fix = (
+                                f"EXPAND CONTENT: current draft is only ~{wc} words. "
+                                f"Must reach at least {word_count_min} words. "
+                                f"Add more detail, examples, and actionable sections."
+                            )
+                            recovery_write = _writer.write_draft(
+                                content_row    = row,
+                                research_result = _research or {},
+                                config          = self.config,
+                                previous_draft  = draft_text,
+                                required_fixes  = [expansion_fix],
+                            )
+                            new_draft = recovery_write.get("html", "") or draft_text
+                            new_wc    = len(re.sub(r'<[^>]+>', ' ', new_draft).split())
+                            print(f"   ✍️  Recovery draft: {new_wc} words.")
+
+                            rev = _reviewer.review_draft(
+                                content_row     = row,
+                                draft_text      = new_draft,
+                                research_result = _research or {},
+                                config          = self.config,
+                            )
+                            rev_status = rev.get("status", "")
+
+                            if new_wc >= word_count_min and rev_status in ("PASS", "PASS_WITH_NOTES"):
+                                draft_text = new_draft
+                                self._update_cells(plan_sheet, index, {
+                                    "Draft_Content": new_draft,
+                                    "WordCount":     str(new_wc),
+                                    "Reviewer_Notes": rev.get("reviewer_summary",
+                                                              row.get("Reviewer_Notes", "")),
+                                })
+                                print(f"   ✅ Recovery succeeded ({new_wc} words, {rev_status}).")
+                            else:
+                                print(f"   ❌ Recovery failed ({new_wc} words, {rev_status}) "
+                                      f"— needs topic change on next full run.")
+                                self._update_cells(plan_sheet, index, {
+                                    "Status":         "Needs Review",
+                                    "Reviewer_Notes": (
+                                        f"Recovery failed: {new_wc} words after rewrite. "
+                                        f"Needs topic change."
+                                    ),
+                                })
+                                self.db.log_task("Optimizer", title, "RECOVERY_FAILED",
+                                                 f"{new_wc} words after rewrite")
+                                continue  # skip Optimizer for this row
 
                         reviewer_result = {
                             "status":           "PASS",
@@ -1037,7 +1121,7 @@ class ContentOrchestrator:
 
                         optimizer_result = optimizer.optimize_draft(
                             content_row     = row,
-                            draft_text      = row.get("Draft_Content", ""),
+                            draft_text      = draft_text,
                             reviewer_result = reviewer_result,
                             config          = self.config
                         )
