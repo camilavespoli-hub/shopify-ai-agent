@@ -582,21 +582,11 @@ class OptimizerAgent:
         self.shopify_token  = os.getenv("SHOPIFY_ACCESS_TOKEN")
 
         # ── ChromaDB vector store ──────────────────────────────────────────
-        # Stores published article summaries for related-reading suggestions.
-        # Uses sentence-transformers (local model — no API call needed).
-        if CHROMADB_AVAILABLE:
-            self.chroma_client = chromadb.PersistentClient(path="./chroma_db")
-            self.embed_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
-                model_name="all-MiniLM-L6-v2"
-            )
-            self.collection = self.chroma_client.get_or_create_collection(
-                name="blog_history",
-                embedding_function=self.embed_fn
-            )
-        else:
-            self.chroma_client = None
-            self.collection = None
-            print("⚠️  chromadb not installed — related-reading suggestions disabled.")
+        # Lazy-initialised on first use to avoid blocking startup on model download.
+        self.chroma_client = None
+        self.embed_fn      = None
+        self.collection    = None
+        self._chroma_ready = False
 
         # ── Non-blocking warning keywords ──────────────────────────────────
         # Warnings that contain any of these strings will NOT change the
@@ -614,6 +604,24 @@ class OptimizerAgent:
             "below the"
         ]
 
+
+    # ── ChromaDB lazy init ───────────────────────────────────────────────
+    def _init_chroma(self):
+        """Load the SentenceTransformer model and connect to ChromaDB on first use."""
+        if self._chroma_ready or not CHROMADB_AVAILABLE:
+            return
+        try:
+            self.chroma_client = chromadb.PersistentClient(path="./chroma_db")
+            self.embed_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
+                model_name="all-MiniLM-L6-v2"
+            )
+            self.collection = self.chroma_client.get_or_create_collection(
+                name="blog_history",
+                embedding_function=self.embed_fn
+            )
+            self._chroma_ready = True
+        except Exception as e:
+            print(f"⚠️  ChromaDB init failed — related-reading disabled: {e}")
 
     # ── TOOL 1: Shopify Products ─────────────────────────────────────────
     def get_shopify_products_graphql(self):
@@ -682,6 +690,7 @@ class OptimizerAgent:
         This result is injected into the prompt so Gemini can add a
         <div class="related-reading"> section at the end of the article.
         """
+        self._init_chroma()
         if not self.collection:
             return ""
         try:
@@ -714,6 +723,7 @@ class OptimizerAgent:
             summary : plain text summary (used as embedding vector)
             url     : Shopify storefront URL (e.g., /blogs/sleep/article-handle)
         """
+        self._init_chroma()
         if not self.collection:
             return
         try:
