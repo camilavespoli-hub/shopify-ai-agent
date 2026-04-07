@@ -376,7 +376,8 @@ class ContentOrchestrator:
             print(f"   ⚠️  Telegram alert failed: {e}")
 
     def send_telegram_alert(self, title: str, admin_url: str = "",
-                            hidden: bool = False, reason: str = ""):
+                            hidden: bool = False, reason: str = "",
+                            section: str = ""):
         pub_prompts = self.config.get("prompts", {}).get("publisher", {})
 
         if hidden:
@@ -384,6 +385,7 @@ class ContentOrchestrator:
             if template:
                 message = (template
                     .replace("{title}",     title)
+                    .replace("{section}",   section or "")
                     .replace("{reason}",    reason or "Red flags detected")
                     .replace("{admin_url}", admin_url or "Check Shopify Admin")
                 )
@@ -391,7 +393,8 @@ class ContentOrchestrator:
                 message = (
                     f"⚠️ *Post Published as HIDDEN — Needs Review*\n\n"
                     f"*Title:* {title}\n"
-                    f"*Reason:* {reason or 'Red flags detected'}\n"
+                    + (f"*Category:* {section}\n" if section else "")
+                    + f"*Reason:* {reason or 'Red flags detected'}\n"
                     f"*Review:* {admin_url or 'Check Shopify Admin'}"
                 )
         else:
@@ -399,13 +402,15 @@ class ContentOrchestrator:
             if template:
                 message = (template
                     .replace("{title}",     title)
+                    .replace("{section}",   section or "")
                     .replace("{admin_url}", admin_url or "Check Shopify Admin")
                 )
             else:
                 message = (
                     f"🚀 *New Blog Post Published!*\n\n"
                     f"*Title:* {title}\n"
-                    f"*Review:* {admin_url or 'Check Shopify Admin'}"
+                    + (f"*Category:* {section}\n" if section else "")
+                    + f"*Review:* {admin_url or 'Check Shopify Admin'}"
                 )
 
         self._send_telegram(message)
@@ -417,7 +422,7 @@ class ContentOrchestrator:
             try:
                 rows = plan_sheet.get_all_records()
                 total      = len([r for r in rows if r.get("Title")])
-                published  = len([r for r in rows if r.get("Published_Status") == "published"])
+                published  = len([r for r in rows if r.get("Published_Status") in ("Live", "Hidden - Needs Review")])
                 pending    = len([r for r in rows if r.get("Status") == "Pending Approval"])
                 needs_rev  = len([r for r in rows if r.get("Status") == "Needs Review"])
                 ready      = len([r for r in rows if r.get("Status") == "Ready to Publish"])
@@ -1226,13 +1231,15 @@ class ContentOrchestrator:
                                     title     = title,
                                     admin_url = admin_url,
                                     hidden    = True,
-                                    reason    = hidden_reason or row.get("Reviewer_Notes", "")
+                                    reason    = hidden_reason or row.get("Reviewer_Notes", ""),
+                                    section   = row.get("Section", "")
                                 )
                             else:
                                 self.send_telegram_alert(
                                     title     = title,
                                     admin_url = admin_url,
-                                    hidden    = False
+                                    hidden    = False,
+                                    section   = row.get("Section", "")
                                 )
 
                             if test_mode:
