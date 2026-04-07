@@ -489,18 +489,12 @@ class ContentOrchestrator:
             print("🛑 Stopped: 'Source_Policy' missing from Config_Brand.")
             return
 
-        planner    = PlannerAgent(config=self.config)
-        researcher = ResearcherAgent(config=self.config)
-        writer     = WriterAgent(config=self.config)
-        reviewer   = ReviewerAgent(config=self.config)
-        optimizer  = OptimizerAgent(config=self.config)
-        publisher  = PublisherAgent(config=self.config, optimizer_agent=optimizer)
-
         # ══════════════════════════════════════════════════════════════════════
         # AGENT 1: PLANNER
         # ══════════════════════════════════════════════════════════════════════
-        
+
         if start_from_agent <= 1:
+            planner = PlannerAgent(config=self.config)
             print("─" * 60)
             print("🧠 AGENT 1: PLANNER")
             try:
@@ -634,6 +628,7 @@ class ContentOrchestrator:
         # AGENT 2: RESEARCHER
         # ══════════════════════════════════════════════════════════════════════
         if start_from_agent <= 2:
+            researcher = ResearcherAgent(config=self.config)
             print("\n" + "─" * 60)
             print("🔬 AGENT 2: RESEARCHER")
             try:
@@ -718,6 +713,8 @@ class ContentOrchestrator:
         # ══════════════════════════════════════════════════════════════════════
         
         if start_from_agent <= 3:
+            writer   = WriterAgent(config=self.config)
+            reviewer = ReviewerAgent(config=self.config)
             print("\n" + "─" * 60)
             print("✍️  AGENT 3: WRITER  +  🛡️ AGENT 4: REVIEWER (rewrite loop)")
             try:
@@ -953,7 +950,7 @@ class ContentOrchestrator:
                             "Draft_Content":  best_draft,
                             "WordCount":      str(len(re.sub(r'<[^>]+>', ' ', best_draft).split())),
                             "Reviewer_Notes": best_reviewer_summary,
-                            "Status":         "Ready_To_Publish",
+                            "Status":         "Ready to Publish",
                             "Visibility":     "hidden" if final_status == "hidden" else "",
                             "Title":          row.get("Title", title),  # update if topic was swapped
                         })
@@ -999,6 +996,7 @@ class ContentOrchestrator:
         #   - reads Status == "Ready_To_Publish"  (was "Content Approved" — never set)
         # ══════════════════════════════════════════════════════════════════════
         if start_from_agent <= 5:
+            optimizer = OptimizerAgent(config=self.config)
             print("\n" + "─" * 60)
             print("⚙️  AGENT 5: OPTIMIZER")
 
@@ -1016,8 +1014,7 @@ class ContentOrchestrator:
 
                 for index, row in enumerate(existing_records, start=2):
                     try:
-                        # ✅ FIX: "Ready_To_Publish" is what Agent 3+4 writes
-                        OPTIMIZER_ELIGIBLE = ("Ready_To_Publish", "Needs Review")
+                        OPTIMIZER_ELIGIBLE = ("Ready to Publish", "Needs Review")
                         if row.get("Status") not in OPTIMIZER_ELIGIBLE:
                             continue
                         if not row.get("Draft_Content"):
@@ -1111,6 +1108,8 @@ class ContentOrchestrator:
         #   - ChromaDB save siempre ocurre en Orchestrator (hidden o public)
         # ══════════════════════════════════════════════════════════════════════
         if start_from_agent <= 6:
+            optimizer_ref = optimizer if start_from_agent <= 5 else None
+            publisher = PublisherAgent(config=self.config, optimizer_agent=optimizer_ref)
             print("\n" + "─" * 60)
             print("🚀 AGENT 6: PUBLISHER")
 
@@ -1118,7 +1117,7 @@ class ContentOrchestrator:
                 "publisher", "telegram_on_hidden", default=True
             )
             published_today = 0
-            max_per_run = int(self._get_rule("publisher", "max_per_run", default=1) or 1)
+            max_per_run = int(self._get_rule("publisher", "max_per_run", default=50) or 50)
 
             try:
                 existing_records = plan_sheet.get_all_records()
@@ -1132,14 +1131,6 @@ class ContentOrchestrator:
                         if row.get("Published_Status"):
                             continue
 
-                        # ── NEW: only publish if ScheduledDate is today or past ──
-                        from datetime import date
-                        today_str      = date.today().strftime("%Y-%m-%d")
-                        scheduled_date = str(row.get("ScheduledDate", "")).strip()
-                        if scheduled_date and scheduled_date > today_str:
-                            print(f"   ⏳ '{row.get('Title', '')}' scheduled for "
-                                  f"{scheduled_date} — skipping today.")
-                            continue
                         if published_today >= max_per_run:
                             print(f"   ⏸️  Max {max_per_run} post(s) per run reached — stopping.")
                             break

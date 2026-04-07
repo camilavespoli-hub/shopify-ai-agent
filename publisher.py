@@ -456,11 +456,12 @@ class PublisherAgent:
                 "errors": [f"Shopify userError: {msg}"]
             }
 
-        article   = result["articleCreate"]["article"]
-        raw_id    = article["id"]
-        handle    = article.get("handle", "")
-        clean_id  = raw_id.split("/")[-1]
-        admin_url = f"https://{self.shop}.myshopify.com/admin/articles/{clean_id}"
+        article       = result["articleCreate"]["article"]
+        raw_id        = article["id"]
+        handle        = article.get("handle", "")
+        clean_id      = raw_id.split("/")[-1]
+        clean_blog_id = blog_id.split("/")[-1]
+        admin_url     = f"https://{self.shop}.myshopify.com/admin/blogs/{clean_blog_id}/articles/{clean_id}"
 
         # Step 9: ChromaDB
         if self.optimizer_agent and summary and not is_hidden:
