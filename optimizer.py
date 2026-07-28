@@ -847,7 +847,7 @@ class OptimizerAgent:
                 edges {
                   node {
                     handle
-                    articles(first: %d, sortKey: PUBLISHED_AT, reverse: true) {
+                    articles(first: %d, reverse: true) {
                       edges { node { title handle isPublished } }
                     }
                   }

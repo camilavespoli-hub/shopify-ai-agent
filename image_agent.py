@@ -112,11 +112,14 @@ class ImageAgent:
 
     def _fal_generate(self, prompt, image_size="landscape_16_9"):
         """
-        Calls fal.ai synchronously. Returns PNG/JPEG bytes or None.
+        Calls fal.ai synchronously. Returns (bytes, fal_url) or (None, "").
+        The fal.media URL is kept as a fallback featured-image source when
+        Shopify Files upload is unavailable (missing write_files scope) —
+        articleCreate ingests external URLs into Shopify's own CDN.
         flux-2-pro ≈ $0.03–0.05 per image.
         """
         if not self.fal_key:
-            return None
+            return None, ""
         try:
             response = requests.post(
                 f"https://fal.run/{self.fal_model}",
@@ -131,13 +134,13 @@ class ImageAgent:
             images = response.json().get("images", [])
             if not images:
                 print("   ⚠️  fal.ai returned no images.")
-                return None
+                return None, ""
             img_url = images[0]["url"]
             img_bytes = requests.get(img_url, timeout=60).content
-            return img_bytes
+            return img_bytes, img_url
         except Exception as e:
             print(f"   ⚠️  fal.ai generation failed: {e}")
-            return None
+            return None, ""
 
 
     # ══════════════════════════════════════════════════════════════════════
@@ -179,19 +182,19 @@ class ImageAgent:
         """
         Generate → QA review → regenerate loop (max self.max_gen_attempts).
         On rejection, the QA reason is appended to the prompt as negative
-        feedback for the next attempt. Returns image bytes or None.
+        feedback for the next attempt. Returns (bytes, fal_url) or (None, "").
         """
         feedback = ""
         for attempt in range(1, self.max_gen_attempts + 1):
             print(f"   🎨 Generating {image_purpose} (attempt {attempt}/{self.max_gen_attempts})...")
-            img = self._fal_generate(prompt + feedback, image_size=image_size)
+            img, fal_url = self._fal_generate(prompt + feedback, image_size=image_size)
             if not img:
-                return None
+                return None, ""
 
             verdict = self.review_image(img, article_title, image_purpose)
             if verdict["approved"]:
                 print(f"   ✅ QA approved: {verdict['reason']}")
-                return img
+                return img, fal_url
 
             print(f"   ❌ QA rejected: {verdict['reason']}")
             feedback = (
@@ -199,7 +202,7 @@ class ImageAgent:
                 f"reason, fix it: {verdict['reason']}"
             )
         print(f"   ⚠️  All {self.max_gen_attempts} attempts rejected by QA.")
-        return None
+        return None, ""
 
 
     # ══════════════════════════════════════════════════════════════════════
@@ -566,7 +569,8 @@ Rules: only facts actually stated in the article. No disease claims
         )
         featured_url = ""
         featured_alt = f"{keyword} — {self.brand_name}"
-        hero_bytes = self.generate_with_qa(
+        files_upload_ok = True   # flips False if Shopify Files rejects uploads
+        hero_bytes, hero_fal_url = self.generate_with_qa(
             hero_prompt, title, "featured hero image", image_size="landscape_16_9"
         )
         if hero_bytes:
@@ -574,6 +578,14 @@ Rules: only facts actually stated in the article. No disease claims
                 hero_bytes, f"{slug}-hero.jpg", featured_alt,
                 mime_type="image/jpeg",
             ) or ""
+            if not featured_url:
+                files_upload_ok = False
+            if not featured_url and hero_fal_url:
+                # No write_files scope? articleCreate ingests external URLs
+                # into Shopify's own CDN — pass the fal.media URL directly.
+                print("   🔁 Shopify Files upload unavailable — using fal.media "
+                      "URL (Shopify ingests it on articleCreate).")
+                featured_url = hero_fal_url
         if not featured_url:
             warnings.append("Hero image failed — Publisher will use stock fallback.")
 
@@ -586,21 +598,34 @@ Rules: only facts actually stated in the article. No disease claims
             f"(hands, objects, a quiet routine) rather than a full portrait. "
             f"{scene_context} Landscape 4:3 composition."
         )
-        inline_bytes = self.generate_with_qa(
-            inline_prompt, title, "inline body image", image_size="landscape_4_3"
-        )
+        inline_bytes = None
+        if not files_upload_ok:
+            # Don't spend a generation on an image we can't host —
+            # body images need Shopify Files (write_files scope).
+            print("   ⏭️  Skipping inline image — Shopify Files upload unavailable.")
+        else:
+            inline_bytes, _ = self.generate_with_qa(
+                inline_prompt, title, "inline body image", image_size="landscape_4_3"
+            )
         if inline_bytes:
             inline_url = self.upload_image(
                 inline_bytes, f"{slug}-inline.jpg", inline_alt,
                 mime_type="image/jpeg",
             ) or ""
         if not inline_url:
+            # NOTE: no fal.media fallback here on purpose — body <img> tags
+            # need a durable host (fal URLs are not guaranteed to persist),
+            # so inline photos require the write_files scope.
             warnings.append("Inline image failed — article body has no photo.")
 
         # ── 3. Infographic ────────────────────────────────────────────────
         infographic_url = ""
         infographic_alt = f"{keyword} infographic — key facts by {self.brand_name}"
-        data = self.extract_infographic_data(html, title, keyword)
+        data = None
+        if not files_upload_ok:
+            print("   ⏭️  Skipping infographic — Shopify Files upload unavailable.")
+        else:
+            data = self.extract_infographic_data(html, title, keyword)
         if data:
             try:
                 info_bytes = self.render_infographic(data)
