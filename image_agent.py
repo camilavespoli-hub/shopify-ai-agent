@@ -3,6 +3,7 @@ import io
 import re
 import json
 import time
+import base64
 import textwrap
 import requests
 from bs4 import BeautifulSoup
@@ -80,10 +81,16 @@ class ImageAgent:
             print("   ⚠️  FAL_KEY missing — image generation disabled "
                   "(infographic still works).")
 
-        # ── Gemini (QA review + fact extraction) ───────────────────────────
+        # ── Gemini (QA review + fact extraction + image generation) ────────
         api_key = os.getenv("GEMINI_API_KEY")
         self.client       = genai.Client(api_key=api_key) if api_key else None
         self.review_model = os.getenv("GEMINI_REVIEW_MODEL", REVIEW_MODEL_DEFAULT)
+
+        # Primary generator: "gemini" (free tier: 500 img/day) or "fal" (paid).
+        # Gemini attempts run first; if its images fail brand QA, the loop
+        # falls back to fal.ai flux-2-pro automatically.
+        self.image_model       = os.getenv("GEMINI_IMAGE_MODEL", "gemini-2.5-flash-image")
+        self.primary_generator = os.getenv("IMAGE_PRIMARY", "gemini").strip().lower()
 
         # ── Shopify (upload) — same client-credentials flow as Publisher ───
         self.shop          = os.getenv("SHOPIFY_SHOP")
@@ -143,6 +150,48 @@ class ImageAgent:
             return None, ""
 
 
+    # ── Gemini image generation (free tier) ────────────────────────────────
+    def _gemini_generate(self, prompt, aspect_ratio="16:9"):
+        """
+        Generates an image with Gemini 2.5 Flash Image. Returns bytes or None.
+        Free tier: up to 500 images/day — the QA loop gates quality, and
+        fal.ai flux-2-pro remains the paid fallback when QA rejects these.
+        """
+        api_key = os.getenv("GEMINI_API_KEY")
+        if not api_key:
+            return None
+        # REST call (not the SDK): imageConfig.aspectRatio support is
+        # guaranteed at the API level regardless of installed SDK version.
+        # Verified live: 16:9 → 1344×768.
+        try:
+            response = requests.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/"
+                f"{self.image_model}:generateContent?key={api_key}",
+                headers={"Content-Type": "application/json"},
+                json={
+                    "contents": [{"parts": [{"text": prompt}]}],
+                    "generationConfig": {
+                        "responseModalities": ["IMAGE", "TEXT"],
+                        "imageConfig": {"aspectRatio": aspect_ratio},
+                    },
+                },
+                timeout=120,
+            )
+            data = response.json()
+            if "error" in data:
+                print(f"   ⚠️  Gemini image API error: "
+                      f"{data['error'].get('message', '')[:150]}")
+                return None
+            for part in data["candidates"][0]["content"]["parts"]:
+                inline = part.get("inlineData", {})
+                if inline.get("data"):
+                    return base64.b64decode(inline["data"])
+            print("   ⚠️  Gemini returned no image part.")
+        except Exception as e:
+            print(f"   ⚠️  Gemini image generation failed: {e}")
+        return None
+
+
     # ══════════════════════════════════════════════════════════════════════
     # QA REVIEWER — Gemini vision approves/rejects every generated image
     # ══════════════════════════════════════════════════════════════════════
@@ -160,7 +209,7 @@ class ImageAgent:
                 model=self.review_model,
                 contents=[
                     genai_types.Part.from_bytes(
-                        data=image_bytes, mime_type="image/jpeg"
+                        data=image_bytes, mime_type=self._mime_of(image_bytes)[0]
                     ),
                     f"{QA_CHECKLIST}\n\nARTICLE TOPIC: {article_title}\n"
                     f"IMAGE PURPOSE: {image_purpose}",
@@ -180,28 +229,48 @@ class ImageAgent:
     def generate_with_qa(self, prompt, article_title, image_purpose,
                           image_size="landscape_16_9"):
         """
-        Generate → QA review → regenerate loop (max self.max_gen_attempts).
-        On rejection, the QA reason is appended to the prompt as negative
-        feedback for the next attempt. Returns (bytes, fal_url) or (None, "").
+        Generate → QA review → regenerate loop.
+
+        Attempt order (cost-optimized):
+          1-2. Gemini 2.5 Flash Image (free tier) — if IMAGE_PRIMARY=gemini
+          3+.  fal.ai flux-2-pro (paid, ~$0.03-0.05) — up to max_gen_attempts
+
+        The SAME brand-QA vision review gates every image regardless of
+        which model generated it. On rejection, the QA reason is appended
+        to the prompt as negative feedback for the next attempt.
+
+        Returns (bytes, fal_url) — fal_url is "" for Gemini-generated images
+        (they have no public URL; only fal images can skip Shopify Files).
         """
+        aspect = "16:9" if "16_9" in image_size else "4:3"
+
+        attempts = []
+        if self.primary_generator == "gemini" and self.client:
+            attempts += [("gemini", 1), ("gemini", 2)]
+        if self.fal_key:
+            attempts += [("fal", i + 1) for i in range(self.max_gen_attempts)]
+
         feedback = ""
-        for attempt in range(1, self.max_gen_attempts + 1):
-            print(f"   🎨 Generating {image_purpose} (attempt {attempt}/{self.max_gen_attempts})...")
-            img, fal_url = self._fal_generate(prompt + feedback, image_size=image_size)
+        for source, n in attempts:
+            print(f"   🎨 Generating {image_purpose} [{source} #{n}]...")
+            if source == "gemini":
+                img, fal_url = self._gemini_generate(prompt + feedback, aspect), ""
+            else:
+                img, fal_url = self._fal_generate(prompt + feedback, image_size=image_size)
             if not img:
-                return None, ""
+                continue  # generator error — try the next attempt/source
 
             verdict = self.review_image(img, article_title, image_purpose)
             if verdict["approved"]:
-                print(f"   ✅ QA approved: {verdict['reason']}")
+                print(f"   ✅ QA approved [{source}]: {verdict['reason']}")
                 return img, fal_url
 
-            print(f"   ❌ QA rejected: {verdict['reason']}")
+            print(f"   ❌ QA rejected [{source}]: {verdict['reason']}")
             feedback = (
                 f"\n\nIMPORTANT — the previous attempt was rejected for this "
                 f"reason, fix it: {verdict['reason']}"
             )
-        print(f"   ⚠️  All {self.max_gen_attempts} attempts rejected by QA.")
+        print(f"   ⚠️  No generator produced a QA-approved {image_purpose}.")
         return None, ""
 
 
@@ -487,6 +556,13 @@ Rules: only facts actually stated in the article. No disease claims
     # ══════════════════════════════════════════════════════════════════════
 
     @staticmethod
+    def _mime_of(image_bytes):
+        """Detects PNG vs JPEG from magic bytes (Gemini → PNG, fal → JPEG)."""
+        if image_bytes[:8] == b"\x89PNG\r\n\x1a\n":
+            return "image/png", "png"
+        return "image/jpeg", "jpg"
+
+    @staticmethod
     def _img_tag(soup, url, alt):
         tag = soup.new_tag(
             "img", src=url, alt=alt,
@@ -574,9 +650,10 @@ Rules: only facts actually stated in the article. No disease claims
             hero_prompt, title, "featured hero image", image_size="landscape_16_9"
         )
         if hero_bytes:
+            hero_mime, hero_ext = self._mime_of(hero_bytes)
             featured_url = self.upload_image(
-                hero_bytes, f"{slug}-hero.jpg", featured_alt,
-                mime_type="image/jpeg",
+                hero_bytes, f"{slug}-hero.{hero_ext}", featured_alt,
+                mime_type=hero_mime,
             ) or ""
             if not featured_url:
                 files_upload_ok = False
@@ -586,6 +663,20 @@ Rules: only facts actually stated in the article. No disease claims
                 print("   🔁 Shopify Files upload unavailable — using fal.media "
                       "URL (Shopify ingests it on articleCreate).")
                 featured_url = hero_fal_url
+            elif not featured_url and self.fal_key:
+                # Gemini-generated hero has no public URL — regenerate once
+                # with fal.ai just to obtain a URL Shopify can ingest.
+                print("   🔁 Upload unavailable and hero has no URL — "
+                      "regenerating hero with fal.ai for its public URL...")
+                fal_bytes, fal_url = self._fal_generate(
+                    hero_prompt, image_size="landscape_16_9"
+                )
+                if fal_bytes and fal_url:
+                    verdict = self.review_image(
+                        fal_bytes, title, "featured hero image"
+                    )
+                    if verdict["approved"]:
+                        featured_url = fal_url
         if not featured_url:
             warnings.append("Hero image failed — Publisher will use stock fallback.")
 
@@ -608,9 +699,10 @@ Rules: only facts actually stated in the article. No disease claims
                 inline_prompt, title, "inline body image", image_size="landscape_4_3"
             )
         if inline_bytes:
+            inline_mime, inline_ext = self._mime_of(inline_bytes)
             inline_url = self.upload_image(
-                inline_bytes, f"{slug}-inline.jpg", inline_alt,
-                mime_type="image/jpeg",
+                inline_bytes, f"{slug}-inline.{inline_ext}", inline_alt,
+                mime_type=inline_mime,
             ) or ""
         if not inline_url:
             # NOTE: no fal.media fallback here on purpose — body <img> tags
