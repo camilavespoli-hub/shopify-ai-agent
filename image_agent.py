@@ -574,27 +574,43 @@ Rules: only facts actually stated in the article. No disease claims
     def insert_images(self, html, inline_url, inline_alt,
                        infographic_url, infographic_alt):
         """
-        Inserts inline <img> tags into the optimized HTML:
-          - inline lifestyle image → after the first <h2>'s first paragraph
-          - infographic            → right before the FAQ (or Sources) section
+        Inserts inline <img> tags into the optimized HTML.
+
+        Placement (SEO/engagement research — see commit message):
+          - infographic → HIGH in the article, right after the answer-first
+            paragraph. Near-fold visuals lift dwell time, Pinterest saves,
+            and Google Discover CTR; bottom placement is barely seen.
+          - inline lifestyle photo → mid-article, after the 2nd content
+            <h2>'s first paragraph, to break up the long text middle.
         Returns the modified HTML string.
         """
         soup = BeautifulSoup(html, "html.parser")
 
-        if inline_url:
-            first_h2 = soup.find("h2")
-            anchor = first_h2.find_next("p") if first_h2 else None
-            if anchor:
-                anchor.insert_after(self._img_tag(soup, inline_url, inline_alt))
-            else:
-                soup.append(self._img_tag(soup, inline_url, inline_alt))
+        # Content H2s only — exclude headings inside FAQ/Sources sections
+        content_h2s = [
+            h2 for h2 in soup.find_all("h2")
+            if not h2.find_parent("section", class_=["faq", "sources"])
+        ]
 
         if infographic_url:
-            target = (soup.find("section", class_="faq")
-                      or soup.find("section", class_="sources"))
-            tag = self._img_tag(soup, infographic_url, infographic_alt)
-            if target:
-                target.insert_before(tag)
+            tag    = self._img_tag(soup, infographic_url, infographic_alt)
+            anchor = soup.find("p", class_="answer-first")
+            if anchor is None and content_h2s:
+                anchor = content_h2s[0].find_previous("p")
+            if anchor is not None:
+                anchor.insert_after(tag)
+            else:
+                target = (soup.find("section", class_="faq")
+                          or soup.find("section", class_="sources"))
+                target.insert_before(tag) if target else soup.append(tag)
+
+        if inline_url:
+            tag = self._img_tag(soup, inline_url, inline_alt)
+            h2  = content_h2s[1] if len(content_h2s) > 1 else (
+                  content_h2s[0] if content_h2s else None)
+            anchor = h2.find_next("p") if h2 else None
+            if anchor is not None:
+                anchor.insert_after(tag)
             else:
                 soup.append(tag)
 
