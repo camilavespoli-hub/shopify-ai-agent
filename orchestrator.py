@@ -15,6 +15,7 @@ from writer           import WriterAgent
 from reviewer         import ReviewerAgent
 from optimizer        import OptimizerAgent
 from publisher        import PublisherAgent
+from image_agent      import ImageAgent
 
 try:
     from chroma_manager import ChromaManager
@@ -1008,7 +1009,8 @@ class ContentOrchestrator:
             non_blocking_raw      = self._get_rule(
                 "orchestrator", "non_blocking_warnings",
                 default="Internal link inventory unavailable,schema_type missing, \
-                        No inline images,Featured image is attached,Word count"
+                        No inline images,Featured image is attached,Word count, \
+                        Invalid JSON-LD dropped"
             )
             non_blocking_warnings = [
                 w.strip() for w in str(non_blocking_raw).split(",") if w.strip()
@@ -1202,6 +1204,15 @@ class ContentOrchestrator:
             print("\n" + "─" * 60)
             print("🚀 AGENT 6: PUBLISHER")
 
+            # ── Agent 5.5: Image Agent (hero + inline photo + infographic) ──
+            # Runs per-article just before publish. Any failure degrades to
+            # the old stock-photo behavior — it can never block publishing.
+            try:
+                image_agent = ImageAgent(config=self.config)
+            except Exception as img_init_e:
+                image_agent = None
+                print(f"⚠️  ImageAgent init failed — stock images only: {img_init_e}")
+
             telegram_on_hidden = self._get_rule(
                 "publisher", "telegram_on_hidden", default=True
             )
@@ -1244,6 +1255,26 @@ class ContentOrchestrator:
                             "word_count":       row.get("WordCount",          0),
                             "warnings":         [],
                         }
+
+                        # ── Agent 5.5: generate + QA + upload images ────────
+                        if image_agent:
+                            try:
+                                img_res = image_agent.process_article(
+                                    content_row      = row,
+                                    optimizer_result = optimizer_result,
+                                )
+                                if img_res.get("html"):
+                                    optimizer_result["html"] = img_res["html"]
+                                if img_res.get("featured_image_url"):
+                                    optimizer_result["featured_image_url"] = \
+                                        img_res["featured_image_url"]
+                                    optimizer_result["featured_image_alt"] = \
+                                        img_res["featured_image_alt"]
+                                for img_w in img_res.get("warnings", []):
+                                    print(f"   ⚠️  ImageAgent: {img_w}")
+                            except Exception as img_e:
+                                print(f"   ⚠️  ImageAgent failed — "
+                                      f"continuing with stock images: {img_e}")
 
                         # content_row passed to Publisher already has Visibility
                         # from the Sheet — Publisher reads it directly

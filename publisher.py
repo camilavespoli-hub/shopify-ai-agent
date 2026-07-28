@@ -89,6 +89,23 @@ def validate_publisher_inputs(content_row, optimizer_result, config):
 
 
 # ─────────────────────────────────────────────
+# HELPERS
+# ─────────────────────────────────────────────
+
+def truncate_at_word(text, limit):
+    """
+    Truncates text to `limit` chars WITHOUT cutting mid-word.
+    'Perimenopause night swea' → 'Perimenopause night'
+    """
+    if not text or len(text) <= limit:
+        return text
+    cut = text[:limit]
+    if " " in cut:
+        cut = cut.rsplit(" ", 1)[0]
+    return cut.rstrip(" ,;:-–—|")
+
+
+# ─────────────────────────────────────────────
 # MAIN AGENT CLASS
 # ─────────────────────────────────────────────
 
@@ -364,8 +381,19 @@ class PublisherAgent:
         # Step 3: Assemble HTML
         final_body = self._assemble_body(html_content, schema_block)
 
-        # Step 4: Get image (Pexels → Unsplash → placeholder)
-        image_url, image_alt = self._get_featured_image(keyword)
+        # Step 4: Get image (ImageAgent-generated → Pexels → Unsplash → placeholder)
+        generated_url = optimizer_result.get("featured_image_url", "")
+        generated_alt = optimizer_result.get("featured_image_alt", "")
+        if generated_url:
+            image_url, image_alt = generated_url, generated_alt or keyword
+            print(f"   🖼️  Using ImageAgent-generated featured image.")
+        else:
+            image_url, image_alt = self._get_featured_image(keyword)
+            # SEO: featured image alt must contain the primary keyword —
+            # stock-photo alts (Pexels/Unsplash captions) don't.
+            brand_name = brand.get("brand_name", "Glomend")
+            if keyword and keyword.lower() not in (image_alt or "").lower():
+                image_alt = f"{keyword} — {brand_name}"
 
         # Step 5: Find Blog ID
         try:
@@ -400,12 +428,14 @@ class PublisherAgent:
         if meta_title:
             metafields.append({
                 "namespace": "global", "key": "title_tag",
-                "value": meta_title[:60], "type": "single_line_text_field"
+                "value": truncate_at_word(meta_title, 60),
+                "type": "single_line_text_field"
             })
         if meta_desc:
             metafields.append({
                 "namespace": "global", "key": "description_tag",
-                "value": meta_desc[:155], "type": "single_line_text_field"
+                "value": truncate_at_word(meta_desc, 155),
+                "type": "single_line_text_field"
             })
 
         tags = [t.strip() for t in keyword.split(",") if t.strip()][:5]

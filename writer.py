@@ -273,7 +273,9 @@ class WriterAgent:
   <h2>Frequently Asked Questions</h2>
   <div class="faq-item">
     <h3>[Question directly related to this article's topic]</h3>
-    <p>[Answer — 2 to 3 sentences. Sound like a person talking, not a textbook.]</p>
+    <p>[Answer — 40 to 58 words. First sentence answers the question outright,
+    then 1–2 supporting sentences. Sound like a person talking, not a textbook.
+    This exact length is what Google extracts for featured snippets.]</p>
   </div>
   <div class="faq-item">
     <h3>[Second specific question from this article's keyword]</h3>
@@ -312,9 +314,11 @@ REQUIRED STRUCTURE (all sections mandatory):
 
 2. <p class="answer-first">Direct answer to the title question in 40–60 words.</p>
 
-3. Two or three body sections — each answers a sub-question:
+3. Three or four body sections — each answers a sub-question:
    <h2>[Question she would actually Google about this topic]</h2>
-   <p>2–3 sentences. Include <span class="citation">[Source, Year]</span> for every claim.</p>
+   <p>Two short paragraphs (4–6 sentences total). Enough depth to fully
+   answer the question — no filler. Include
+   <span class="citation">[Source, Year]</span> for every claim.</p>
 
 4. <h2>What This Means for You</h2>
    <p>Warm, practical takeaway. What should she actually do with this information?</p>
@@ -687,6 +691,13 @@ BANNED AI PATTERNS — NEVER USE THESE:
 - Never use: "comprehensive", "crucial", "vital", "robust", "dive into",
   "delve", "leverage", "navigate", "unlock", "holistic", "empower".
 
+TRANSITION WORDS — REQUIRED (SEO readability):
+- Connect ideas with natural, conversational transitions in roughly a third
+  of your sentences: "But", "So", "Still", "That's why", "Even so",
+  "On top of that", "Here's the thing", "Because of that", "Either way".
+- These count as transition words for readability scoring WITHOUT sounding
+  like AI. Stiff academic transitions (Furthermore, Moreover) stay banned.
+
 TONAL VARIATION:
 - Start warm, get direct in the middle, end encouraging.
 - Let mild frustration come through: "And honestly? That's exhausting."
@@ -703,6 +714,18 @@ COMPLIANCE ({compliance})
 - EVERY objective health claim needs: <span class="citation">[Source, Year]</span>
 
 BANNED WORDS / PHRASES: {all_banned}
+
+
+════════════════════════════════════════
+SEO KEYWORD RULES — all mandatory
+════════════════════════════════════════
+- Use the EXACT primary keyword "{keyword}" in:
+  · the first paragraph (naturally),
+  · at least TWO <h2> headings (phrased as natural questions — never bolted on),
+  · at least 3 more times across body paragraphs (~1% density — if it reads
+    forced, rephrase the sentence, don't drop the keyword).
+- Use each secondary keyword at least once in an <h2>/<h3> or paragraph.
+- Never keyword-stuff: every use must read like a person wrote it.
 
 
 ════════════════════════════════════════

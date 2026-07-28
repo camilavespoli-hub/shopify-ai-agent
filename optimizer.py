@@ -224,6 +224,62 @@ def parse_optimizer_output(raw_output):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# SCHEMA VALIDATOR
+# ─────────────────────────────────────────────────────────────────────────────
+
+def validate_schema_jsonld(schema_block):
+    """
+    Validates every JSON-LD block in the Gemini-generated schema string.
+
+    A malformed JSON-LD block published to Shopify is silently ignored by
+    Google — worse than no schema at all, because nobody notices. This
+    validates each <script type="application/ld+json"> block (or a bare
+    JSON string) with json.loads before it reaches the Publisher.
+
+    Returns:
+        (clean_schema: str, dropped: [str])
+        clean_schema — only the blocks that parsed as valid JSON
+        dropped      — description of each block that was dropped
+    """
+    if not schema_block or not schema_block.strip():
+        return "", []
+
+    dropped = []
+    blocks  = re.findall(
+        r'<script[^>]*type="application/ld\+json"[^>]*>(.*?)</script>',
+        schema_block, re.DOTALL | re.IGNORECASE
+    )
+    if not blocks:
+        # Bare JSON without <script> wrapper — Publisher adds the wrapper
+        blocks = [schema_block]
+
+    valid_blocks = []
+    for raw in blocks:
+        candidate = raw.strip()
+        try:
+            json.loads(candidate)
+            valid_blocks.append(candidate)
+        except (json.JSONDecodeError, ValueError):
+            # Common Gemini slip: trailing commas — try a light repair
+            repaired = re.sub(r",\s*([}\]])", r"\1", candidate)
+            try:
+                json.loads(repaired)
+                valid_blocks.append(repaired)
+            except (json.JSONDecodeError, ValueError):
+                schema_type = "unknown"
+                m = re.search(r'"@type"\s*:\s*"([^"]+)"', candidate)
+                if m:
+                    schema_type = m.group(1)
+                dropped.append(f"{schema_type} block failed JSON validation")
+
+    clean = "\n".join(
+        f'<script type="application/ld+json">\n{b}\n</script>'
+        for b in valid_blocks
+    )
+    return clean, dropped
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # PROMPT BUILDER
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -382,8 +438,12 @@ Inline formatting:
    use their own class — do NOT add the body color style to those)
 
 Citations:
-- [Source, Year] inline citations → REMOVE from body text entirely.
-  Sources are listed ONLY in the <section class="sources"> at the bottom.
+- [Source, Year] inline citations → KEEP them in the body. Convert to:
+  <span class="citation">(Source, Year)</span> placed immediately after the
+  claim they support. Generative engines (ChatGPT, Perplexity, AI Overviews)
+  cite content whose claims name their study in the SAME sentence — never
+  strip inline citations.
+- ALSO keep the full reference list in <section class="sources"> at the bottom.
 
 Special elements:
 - Opening hook paragraph     → <p class="hook">[text]</p>
@@ -414,6 +474,12 @@ After conversion, verify and fix only if clearly broken:
 2d. Secondary keywords ({secondary_keywords}) must appear in
     at least one <h2> or <p>.
 2e. Do NOT add or remove heading levels beyond the rules above.
+2f. The EXACT primary keyword "{primary_keyword}" must appear in at least
+    TWO <h2> headings. If it doesn't, rephrase existing H2s naturally
+    (keep them as questions) — do NOT add new headings.
+2g. The primary keyword must appear at least 3 times in body paragraphs
+    (~1% density). If below, rephrase existing sentences to include it
+    naturally — do NOT add new sentences just for the keyword.
 
 
 ─── TASK 3: INTERNAL LINKING ─────────────────────────────────────
@@ -452,7 +518,7 @@ Google AI Overviews extract and cite this content accurately.
       <h2 style="color: {faq_title_color};">Frequently Asked Questions</h2>
       <div class="faq-item">
         <h3>[Specific question a perimenopausal woman would actually Google]</h3>
-        <p>[Direct 2–3 sentence answer — no filler, no hedging headers]</p>
+        <p>[Direct answer, 40–58 words — first sentence answers outright]</p>
       </div>
     </section>
 
@@ -461,13 +527,18 @@ Google AI Overviews extract and cite this content accurately.
     <section class="sources"><h2>Sources</h2></section>
     <!-- NEEDS REVIEW: sources section was empty — add citations manually -->
 
+4e. Every FAQ answer must be 40–58 words (the length Google extracts for
+    featured snippets). Trim or expand answers as needed WITHOUT changing
+    any factual claims.
+
 
 ─── TASK 5: METADATA ─────────────────────────────────────────────
 Generate SEO metadata for Shopify:
 
 META TITLE:
   - Primary keyword near the start
-  - Max {meta_title_limit} characters (hard limit — never exceed)
+  - Max {meta_title_limit} characters (hard limit — never exceed;
+    never end mid-word — shorten at a word boundary)
   - Format: [Primary keyword phrase] | {brand_name}
 
 META DESCRIPTION:
@@ -599,6 +670,7 @@ class OptimizerAgent:
             "No inline images",                     # ✅ FIX: images are handled by Publisher
             "Featured image is attached",           # ✅ FIX: informational only
             "Placeholders will be inserted",        # expected — internal links placeholder
+            "Invalid JSON-LD dropped",              # schema dropped, article still fine
             "Word count",
             "word count",
             "below the"
@@ -705,6 +777,113 @@ class OptimizerAgent:
         except Exception as e:
             print(f"⚠️ ChromaDB search failed: {e}")
         return ""
+
+
+    # ── TOOL 2b: Internal Link Inventory (ChromaDB → Shopify fallback) ───
+    def get_internal_link_inventory(self, current_summary, n_results=4):
+        """
+        Builds a real internal-link inventory from previously published
+        articles.
+
+        Source priority:
+          1. ChromaDB vector search (best — semantically related articles)
+          2. Shopify Admin GraphQL (fallback — recent published articles).
+             This matters in CI/GitHub Actions, where chromadb is not
+             installed and the vector store does not persist between runs.
+
+        Returns a formatted string ("- Title → URL" per line) ready to be
+        injected into the Optimizer prompt, or "" if no articles exist yet.
+        """
+        self._init_chroma()
+        if self.collection:
+            try:
+                results = self.collection.query(
+                    query_texts=[current_summary],
+                    n_results=n_results
+                )
+                metadatas = results.get("metadatas", [[]])[0]
+                lines = [
+                    f"- {m['title']} → {m['url']}"
+                    for m in metadatas
+                    if m.get("title") and m.get("url")
+                ]
+                if lines:
+                    return "\n".join(lines)
+            except Exception as e:
+                print(f"⚠️ ChromaDB link inventory failed: {e}")
+
+        return self._get_shopify_articles_inventory(limit=n_results * 3)
+
+
+    def _get_shopify_articles_inventory(self, limit=12):
+        """
+        Fetches recent published articles from Shopify Admin GraphQL and
+        formats them as an internal-link inventory. Uses the same
+        client-credentials OAuth flow as the Publisher (works in CI, where
+        only SHOPIFY_CLIENT_ID/SECRET are available). Never raises.
+        """
+        shop          = os.getenv("SHOPIFY_SHOP")
+        client_id     = os.getenv("SHOPIFY_CLIENT_ID")
+        client_secret = os.getenv("SHOPIFY_CLIENT_SECRET")
+        if not (shop and client_id and client_secret):
+            return ""
+        try:
+            token = requests.post(
+                f"https://{shop}.myshopify.com/admin/oauth/access_token",
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                data={
+                    "grant_type":    "client_credentials",
+                    "client_id":     client_id,
+                    "client_secret": client_secret,
+                },
+                timeout=30,
+            ).json().get("access_token")
+            if not token:
+                return ""
+
+            query = """
+            {
+              blogs(first: 10) {
+                edges {
+                  node {
+                    handle
+                    articles(first: %d, sortKey: PUBLISHED_AT, reverse: true) {
+                      edges { node { title handle isPublished } }
+                    }
+                  }
+                }
+              }
+            }
+            """ % limit
+            response = requests.post(
+                f"https://{shop}.myshopify.com/admin/api/2024-04/graphql.json",
+                headers={
+                    "Content-Type":           "application/json",
+                    "X-Shopify-Access-Token": token,
+                },
+                json={"query": query},
+                timeout=30,
+            )
+            data = response.json()
+            if data.get("errors"):
+                print(f"⚠️ Shopify articles inventory error: {data['errors']}")
+                return ""
+
+            lines = []
+            for blog_edge in data["data"]["blogs"]["edges"]:
+                blog = blog_edge["node"]
+                for art_edge in blog["articles"]["edges"]:
+                    art = art_edge["node"]
+                    if art.get("isPublished"):
+                        lines.append(
+                            f"- {art['title']} → /blogs/{blog['handle']}/{art['handle']}"
+                        )
+            if lines:
+                print(f"   🔗 Link inventory from Shopify: {len(lines)} article(s).")
+            return "\n".join(lines[:limit])
+        except Exception as e:
+            print(f"⚠️ Shopify articles inventory failed: {e}")
+            return ""
 
 
     # ── TOOL 3: Save to Vector Memory ────────────────────────────────────
@@ -821,7 +1000,22 @@ class OptimizerAgent:
                 f"Title: {parts[0].strip()} | URL: {parts[1].strip()}"
             )
 
-        has_internal_links = bool(content_row.get("available_internal_links"))
+        # ── Internal link inventory ──────────────────────────────────────
+        # Priority: Sheet-provided inventory → ChromaDB published articles.
+        # Only fall back to placeholder comments if BOTH are empty.
+        internal_links_text = content_row.get("available_internal_links", "")
+        if not internal_links_text:
+            chroma_inventory = self.get_internal_link_inventory(summary)
+            if chroma_inventory:
+                internal_links_text = chroma_inventory
+                print(f"   🔗 Internal links from ChromaDB:\n{chroma_inventory}")
+                # Remove the stale "inventory unavailable" warning — we have one now
+                validation["warnings"] = [
+                    w for w in validation["warnings"]
+                    if "Internal link inventory unavailable" not in w
+                ]
+
+        has_internal_links = bool(internal_links_text)
         has_schema_config  = bool(config.get("brand", {}).get("schema_type"))
 
         # ── Step 4: Build prompt ─────────────────────────────────────────
@@ -831,7 +1025,7 @@ class OptimizerAgent:
             content_row        = content_row,
             product_list_text  = product_list_text,
             related_reading    = related_reading,
-            internal_links     = content_row.get("available_internal_links", ""),
+            internal_links     = internal_links_text,
             config             = config,
             has_schema_config  = has_schema_config,
             has_internal_links = has_internal_links
@@ -864,6 +1058,16 @@ class OptimizerAgent:
         # Prepend validation warnings (e.g., "internal links unavailable")
         # so they appear at the top of the warning list in the Sheet.
         parsed["warnings"] = validation["warnings"] + parsed["warnings"]
+
+        # ── Step 6b: Validate JSON-LD schema ─────────────────────────────
+        # Invalid blocks are dropped (Google ignores malformed JSON-LD
+        # silently — publishing it would just be dead weight in the body).
+        if parsed.get("schema"):
+            clean_schema, dropped = validate_schema_jsonld(parsed["schema"])
+            parsed["schema"] = clean_schema
+            for d in dropped:
+                print(f"   ⚠️  Invalid JSON-LD dropped: {d}")
+                parsed["warnings"].append(f"Invalid JSON-LD dropped: {d}")
 
         # ── Step 7: Classify warnings ────────────────────────────────────
         # Non-blocking = informational only → article still gets published.

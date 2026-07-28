@@ -2,7 +2,8 @@ name: ShopifyAIAgent
 
 on:
   schedule:
-    - cron: '0 14 * * *'
+    # Every 3 days at 14:00 UTC (days 1,4,7,...28 of each month)
+    - cron: '0 14 */3 * *'
   workflow_dispatch:
 
 env:
@@ -11,7 +12,7 @@ env:
 jobs:
   run-agent:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45   # image generation + QA adds a few minutes per article
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -33,5 +34,6 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
           UNSPLASH_ACCESS_KEY: ${{ secrets.UNSPLASH_ACCESS_KEY }}
+          FAL_KEY: ${{ secrets.FAL_KEY }}
           SHEET_NAME: ${{ secrets.SHEET_NAME }}
         run: python3 orchestrator.py

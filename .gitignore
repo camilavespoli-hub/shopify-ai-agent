@@ -5,6 +5,8 @@ service_account.json
 
 # Database & vector memory
 pipeline.db
+webapp.db
+data/
 chroma_db/
 
 # Logs
