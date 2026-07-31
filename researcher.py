@@ -287,6 +287,9 @@ Preferred domains  : {preferred_domains}
 Minimum authority  : {min_authority}
 - Prioritize peer-reviewed studies and government health sources.
 - Exclude blog posts, forums, and commercial sites as primary sources.
+- NEVER cite supplement brands, e-commerce stores, or their blogs
+  (any URL containing /blogs/, /products/ or /collections/ is FORBIDDEN
+  as a citation — these are competitor marketing pages, not science).
 - If a claim lacks a quality source, mark its confidence as "low".
 
 ════════════════════════════════════════
@@ -483,6 +486,32 @@ No text outside the block. No comments inside the JSON.
             # Ensure citations is always a list — the Writer expects to iterate it
             if "citations" not in parsed_result or not isinstance(parsed_result["citations"], list):
                 parsed_result["citations"] = pubmed_cites  # fall back to PubMed direct
+
+            # ── Hard filter: never cite commercial store blogs ────────────
+            # The prompt already says to exclude commercial sites, but LLMs
+            # slip: a competitor supplement brand's Shopify blog
+            # (URL pattern /blogs/ or /products/) once reached the published
+            # Sources section. Deterministic guard — no exceptions.
+            def _is_store_url(url):
+                u = str(url or "").lower()
+                return "/blogs/" in u or "/products/" in u or "/collections/" in u
+
+            dropped = [
+                c for c in parsed_result["citations"]
+                if _is_store_url(c.get("url"))
+            ]
+            if dropped:
+                parsed_result["citations"] = [
+                    c for c in parsed_result["citations"]
+                    if not _is_store_url(c.get("url"))
+                ]
+                for c in dropped:
+                    print(f"   🚫 Dropped commercial-store citation: "
+                          f"{str(c.get('url'))[:70]}")
+                parsed_result["warnings"].append(
+                    f"{len(dropped)} commercial store-blog citation(s) removed "
+                    "(competitor/e-commerce URLs are never valid sources)."
+                )
 
             # Ensure key_facts is always a list
             if "key_facts" not in parsed_result or not isinstance(parsed_result["key_facts"], list):
